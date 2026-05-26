@@ -55,8 +55,12 @@ export const config = {
     url: optional('SYNCTHING_URL', '').replace(/\/$/, ''),
     apiKey: optional('SYNCTHING_API_KEY', ''),
     folderId: optional('SYNCTHING_FOLDER_ID', ''),
+    folders: optional('SYNCTHING_FOLDERS', '').split(',').map(s => s.trim()).filter(Boolean),
     remoteDeviceId: optional('SYNCTHING_REMOTE_DEVICE_ID', ''),
     remoteLabel: optional('SYNCTHING_REMOTE_LABEL', 'remote'),
+  },
+  dashboard: {
+    token: optional('DASHBOARD_TOKEN', ''),
   },
 };
 

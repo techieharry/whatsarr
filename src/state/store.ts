@@ -327,6 +327,129 @@ export class Store {
     ).run(Date.now(), auditId);
   }
 
+  listAudit(filters: {
+    status?: string;
+    senderNumber?: string;
+    groupJid?: string;
+    since?: number;
+    until?: number;
+    limit?: number;
+    offset?: number;
+  } = {}): {
+    id: number;
+    ts: number;
+    senderJid: string;
+    senderNumber: string;
+    groupJid: string | null;
+    command: string;
+    resolvedRoute: string | null;
+    seerrMediaType: string | null;
+    seerrMediaId: number | null;
+    seerrRequestId: number | null;
+    status: string;
+    retryAttempts: number;
+    lastRetryAt: number | null;
+  }[] {
+    const where: string[] = [];
+    const vals: unknown[] = [];
+    if (filters.status !== undefined) { where.push('status = ?'); vals.push(filters.status); }
+    if (filters.senderNumber !== undefined) { where.push('sender_number = ?'); vals.push(filters.senderNumber); }
+    if (filters.groupJid !== undefined) { where.push('group_jid = ?'); vals.push(filters.groupJid); }
+    if (filters.since !== undefined) { where.push('ts >= ?'); vals.push(filters.since); }
+    if (filters.until !== undefined) { where.push('ts <= ?'); vals.push(filters.until); }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const limit = filters.limit ?? 50;
+    const offset = filters.offset ?? 0;
+    const rows = this.db.prepare(
+      `SELECT id, ts, sender_jid AS senderJid, sender_number AS senderNumber,
+              group_jid AS groupJid, command,
+              resolved_route AS resolvedRoute,
+              seerr_media_type AS seerrMediaType,
+              seerr_media_id AS seerrMediaId,
+              seerr_request_id AS seerrRequestId,
+              status,
+              retry_attempts AS retryAttempts,
+              last_retry_at AS lastRetryAt
+       FROM audit ${whereSql}
+       ORDER BY ts DESC, id DESC
+       LIMIT ? OFFSET ?`,
+    ).all(...vals, limit, offset) as any[];
+    return rows.map(r => ({
+      id: Number(r.id),
+      ts: Number(r.ts),
+      senderJid: r.senderJid,
+      senderNumber: r.senderNumber,
+      groupJid: r.groupJid ?? null,
+      command: r.command,
+      resolvedRoute: r.resolvedRoute ?? null,
+      seerrMediaType: r.seerrMediaType ?? null,
+      seerrMediaId: r.seerrMediaId != null ? Number(r.seerrMediaId) : null,
+      seerrRequestId: r.seerrRequestId != null ? Number(r.seerrRequestId) : null,
+      status: r.status,
+      retryAttempts: Number(r.retryAttempts ?? 0),
+      lastRetryAt: r.lastRetryAt != null ? Number(r.lastRetryAt) : null,
+    }));
+  }
+
+  countAudit(filters: {
+    status?: string;
+    senderNumber?: string;
+    groupJid?: string;
+    since?: number;
+    until?: number;
+  } = {}): number {
+    const where: string[] = [];
+    const vals: unknown[] = [];
+    if (filters.status !== undefined) { where.push('status = ?'); vals.push(filters.status); }
+    if (filters.senderNumber !== undefined) { where.push('sender_number = ?'); vals.push(filters.senderNumber); }
+    if (filters.groupJid !== undefined) { where.push('group_jid = ?'); vals.push(filters.groupJid); }
+    if (filters.since !== undefined) { where.push('ts >= ?'); vals.push(filters.since); }
+    if (filters.until !== undefined) { where.push('ts <= ?'); vals.push(filters.until); }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const r = this.db.prepare(`SELECT COUNT(*) AS c FROM audit ${whereSql}`).get(...vals) as any;
+    return r?.c ?? 0;
+  }
+
+  listFeedback(kind?: 'feedback' | 'issue', limit = 100): {
+    id: number;
+    ts: number;
+    kind: string;
+    senderJid: string;
+    senderNumber: string;
+    groupJid: string | null;
+    body: string;
+    report: string | null;
+  }[] {
+    const rows = kind
+      ? this.db.prepare(
+          `SELECT id, ts, kind, sender_jid AS senderJid, sender_number AS senderNumber,
+                  group_jid AS groupJid, body, report
+           FROM feedback WHERE kind = ? ORDER BY ts DESC LIMIT ?`,
+        ).all(kind, limit) as any[]
+      : this.db.prepare(
+          `SELECT id, ts, kind, sender_jid AS senderJid, sender_number AS senderNumber,
+                  group_jid AS groupJid, body, report
+           FROM feedback ORDER BY ts DESC LIMIT ?`,
+        ).all(limit) as any[];
+    return rows.map(r => ({
+      id: Number(r.id),
+      ts: Number(r.ts),
+      kind: r.kind,
+      senderJid: r.senderJid,
+      senderNumber: r.senderNumber,
+      groupJid: r.groupJid ?? null,
+      body: r.body,
+      report: r.report ?? null,
+    }));
+  }
+
+  countRetryEligible(): number {
+    const r = this.db.prepare(
+      `SELECT COUNT(*) AS c FROM audit WHERE status = 'failed' AND seerr_request_id IS NOT NULL`,
+    ).get() as any;
+    return r?.c ?? 0;
+  }
+
   findRequester(seerrMediaType: string, seerrMediaId: number): { senderJid: string; senderNumber: string; groupJid: string | null } | null {
     const row = this.db.prepare(
       `SELECT sender_jid, sender_number, group_jid FROM audit

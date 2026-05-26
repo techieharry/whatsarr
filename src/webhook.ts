@@ -2,19 +2,31 @@ import { createServer, type IncomingMessage as IM, type ServerResponse } from 'n
 import { config } from './config.ts';
 import { log } from './log.ts';
 import type { Store } from './state/store.ts';
+import * as seerrModule from './seerr/client.ts';
+import * as syncthingModule from './syncthing/client.ts';
+import { authGate, maybeSetTokenCookie } from './dashboard/auth.ts';
+import { dashboardRoute } from './dashboard/routes.ts';
 
 const log_ = log.child({ mod: 'webhook' });
 
 type SendFn = (jid: string, content: { text: string; mentions?: string[] }) => Promise<unknown>;
 
-export function startWebhook(send: SendFn, store: Store): () => void {
+export type WebhookDeps = {
+  send: SendFn;
+  store: Store;
+  seerr: typeof seerrModule;
+  syncthing: typeof syncthingModule;
+  getConnectionStatus: () => { connected: boolean; uptimeSec: number };
+};
+
+export function startWebhook(deps: WebhookDeps): () => void {
   if (!config.webhook.enabled) {
     log_.info('webhook disabled');
     return () => {};
   }
 
   const server = createServer((req, res) => {
-    handle(req, res, send, store).catch(e => {
+    router(req, res, deps).catch(e => {
       log_.error({ err: e?.message }, 'unhandled webhook error');
       try { res.writeHead(500); res.end(); } catch {}
     });
@@ -30,15 +42,43 @@ export function startWebhook(send: SendFn, store: Store): () => void {
   return () => server.close();
 }
 
-async function handle(req: IM, res: ServerResponse, send: SendFn, store: Store) {
-  if (req.method === 'GET' && req.url === '/health') {
+export async function router(req: IM, res: ServerResponse, deps: WebhookDeps): Promise<void> {
+  const url = req.url ?? '/';
+  const path = url.split('?')[0] ?? '/';
+
+  if (req.method === 'GET' && path === '/health') {
     res.writeHead(200, { 'content-type': 'text/plain' }).end('ok');
     return;
   }
-  if (req.method !== 'POST' || req.url !== '/webhook') {
-    res.writeHead(404).end();
+
+  if (req.method === 'POST' && path === '/webhook') {
+    await handleSeerrWebhook(req, res, deps);
     return;
   }
+
+  if (path === '/dashboard' || path.startsWith('/dashboard/') || path.startsWith('/api/')) {
+    maybeSetTokenCookie(req, res, config.dashboard.token);
+    const gate = authGate(req, res, config.dashboard.token);
+    if (!gate.ok) {
+      res.writeHead(gate.status, { 'content-type': 'text/plain' });
+      res.end(gate.body);
+      return;
+    }
+    await dashboardRoute(req, res, {
+      store: deps.store,
+      seerr: deps.seerr,
+      syncthing: deps.syncthing,
+      getConnectionStatus: deps.getConnectionStatus,
+      syncthingFolders: config.syncthing.folders,
+    });
+    return;
+  }
+
+  res.writeHead(404).end();
+}
+
+async function handleSeerrWebhook(req: IM, res: ServerResponse, deps: WebhookDeps): Promise<void> {
+  const { send, store } = deps;
   if (config.seerr.webhookSecret) {
     const got = req.headers['x-webhook-secret'];
     if (got !== config.seerr.webhookSecret) {
@@ -84,10 +124,6 @@ async function handle(req: IM, res: ServerResponse, send: SendFn, store: Store) 
       await send(target, { text, mentions });
       log_.info({ to: target, title, inGroup: !!requester.groupJid }, 'ready notification sent');
     } catch (e: any) {
-      // The injected `send` already retries + enqueues on transient failure.
-      // If we land here it's a non-transient send error (e.g. unknown JID).
-      // Last-ditch: enqueue anyway so it survives a restart and can be drained
-      // when the situation changes.
       store.enqueuePending(target, text, mentions);
       log_.error({ err: e?.message, to: target }, 'ready notification send hard-failed; enqueued');
     }

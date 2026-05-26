@@ -36,6 +36,11 @@ let store: Store | null = null;
 let currentSock: WASocket | null = null;
 let drainTimer: NodeJS.Timeout | null = null;
 let retryTimer: NodeJS.Timeout | null = null;
+const startTime = Date.now();
+const getConnectionStatus = () => ({
+  connected: currentSock !== null,
+  uptimeSec: Math.floor((Date.now() - startTime) / 1000),
+});
 
 async function start(): Promise<void> {
   if (!store) store = new Store(config.storage.dbPath);
@@ -64,10 +69,13 @@ async function start(): Promise<void> {
     if (connection === 'open') {
       log_.info({ user: sock.user?.id }, 'connected');
       if (!stopWebhook) {
-        stopWebhook = startWebhook(
-          (jid, content) => sendViaCurrentSock(jid, content),
-          store!,
-        );
+        stopWebhook = startWebhook({
+          send: (jid, content) => sendViaCurrentSock(jid, content),
+          store: store!,
+          seerr,
+          syncthing,
+          getConnectionStatus,
+        });
       }
       // periodic state cleanup
       setInterval(() => store!.cleanupExpiredState(), 60_000).unref();
