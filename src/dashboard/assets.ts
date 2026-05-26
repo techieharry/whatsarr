@@ -25,6 +25,7 @@ export const INDEX_HTML = `<!doctype html>
     <span id="counters" class="counters"></span>
   </div>
 </header>
+<div id="conn-lost" class="banner" hidden>dashboard cannot reach the bot. retrying…</div>
 
 <main>
   <section id="panel-overview" class="panel" hidden>
@@ -293,6 +294,7 @@ export const APP_JS = String.raw`(function () {
     for (var j = 0; j < tabs.length; j++) {
       tabs[j].classList.toggle('active', tabs[j].getAttribute('data-tab') === name);
     }
+    document.title = name === 'overview' ? 'whatsarr' : 'whatsarr — ' + name;
     if (name === 'feedback') {
       var sub = (location.hash.split('/')[1] === 'issue') ? 'issue' : 'feedback';
       fbState.kind = sub;
@@ -625,10 +627,17 @@ export const APP_JS = String.raw`(function () {
       .catch(function (err) { toast((err && err.message) || 'error', 'err'); });
   }
 
+  var hbFailStreak = 0;
   function pollHeartbeat() {
-    fetchJson('/heartbeat').then(renderHeartbeat).catch(function () {
+    fetchJson('/heartbeat').then(function (hb) {
+      hbFailStreak = 0;
+      $('conn-lost').hidden = true;
+      renderHeartbeat(hb);
+    }).catch(function () {
+      hbFailStreak++;
       var dot = $('conn-dot');
       dot.classList.remove('dot-ok'); dot.classList.add('dot-bad');
+      if (hbFailStreak >= 3) $('conn-lost').hidden = false;
     });
   }
 
@@ -755,13 +764,15 @@ export const APP_CSS = `:root {
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 var(--sans); }
 a { color: var(--accent); text-decoration: none; }
 
-.topbar { display: flex; align-items: center; gap: 1rem; padding: .5rem 1rem; border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+.topbar { display: flex; align-items: center; gap: 1rem; padding: .5rem 1rem; border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
 .brand { font-weight: 600; letter-spacing: .03em; }
-.tabs { display: flex; gap: .25rem; overflow-x: auto; flex: 1; }
-.tab { padding: .35rem .75rem; border-radius: 4px; color: var(--fg-dim); white-space: nowrap; }
+.tabs { display: flex; gap: .25rem; overflow-x: auto; flex: 1 1 100%; order: 3; -ms-overflow-style: none; scrollbar-width: thin; }
+.tab { padding: .35rem .75rem; border-radius: 4px; color: var(--fg-dim); white-space: nowrap; outline-offset: 2px; }
 .tab:hover { background: var(--panel-2); color: var(--fg); }
+.tab:focus-visible { outline: 2px solid var(--accent); }
 .tab.active { background: var(--panel-2); color: var(--fg); border-bottom: 2px solid var(--accent); }
-.status { display: flex; align-items: center; gap: .75rem; color: var(--fg-dim); font-family: var(--mono); font-size: 12px; }
+@media (min-width: 900px) { .tabs { flex: 1 1 0%; order: 0; } }
+.status { display: flex; align-items: center; gap: .75rem; color: var(--fg-dim); font-family: var(--mono); font-size: 12px; margin-left: auto; flex-shrink: 0; }
 .uptime { min-width: 8ch; text-align: right; }
 .counters { white-space: nowrap; }
 
@@ -771,6 +782,7 @@ a { color: var(--accent); text-decoration: none; }
 .dot-unknown { background: var(--grey); }
 
 main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
+[hidden] { display: none !important; }
 .panel { display: flex; flex-direction: column; gap: 1rem; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; }
 .card h2, .card h3 { margin: 0 0 .5rem 0; font-size: 14px; font-weight: 600; color: var(--fg-dim); text-transform: uppercase; letter-spacing: .04em; }
