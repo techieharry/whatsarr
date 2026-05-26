@@ -1,6 +1,6 @@
 import { config } from './config.ts';
 import { log } from './log.ts';
-import { parse, type ParsedCommand, type Category } from './parser/commands.ts';
+import { parse, type ParsedCommand, type Category, type AdminAction } from './parser/commands.ts';
 import { resolveRoute, type MediaType, type Route } from './routing/table.ts';
 import type { Store, AwaitingKind } from './state/store.ts';
 import * as seerrModule from './seerr/client.ts';
@@ -27,8 +27,13 @@ export type Reply = {
 
 export type Deps = {
   store: Store;
-  seerr: Pick<typeof seerrModule, 'search' | 'createRequest' | 'status' | 'getMediaInfo' | 'getTvDetails'>;
+  seerr: Pick<typeof seerrModule,
+    'search' | 'createRequest' | 'status' | 'getMediaInfo' | 'getTvDetails'
+    | 'listPendingRequests' | 'approveRequest' | 'declineRequest' | 'retryRequest'>;
   syncthing?: Pick<typeof syncthingModule, 'isConfigured' | 'getCompletion' | 'getFolderStatus'>;
+  // Optional shutdown hook — wired by the index runtime so !shutdown can trigger
+  // a graceful exit. Tests pass undefined; the admin handler reports the gap.
+  shutdown?: () => void;
 };
 
 type ConfirmPayload = {
@@ -313,7 +318,7 @@ export async function handleMessage(deps: Deps, msg: IncomingMessage): Promise<R
     return [reply(msg.senderJid, hint)];
   }
   if (parsed.kind === 'help') {
-    return [reply(msg.fromJid, helpText())];
+    return [reply(msg.fromJid, helpText(isAdmin(msg.senderNumber)))];
   }
   if (parsed.kind === 'status') {
     try {
@@ -335,9 +340,79 @@ export async function handleMessage(deps: Deps, msg: IncomingMessage): Promise<R
   if (parsed.kind === 'issue') {
     return await handleIssue(deps, msg, parsed.body);
   }
+  if (parsed.kind === 'admin') {
+    return await handleAdmin(deps, msg, parsed);
+  }
   if (parsed.kind === 'request') {
     return await handleRequest(deps, msg, parsed);
   }
+  return [];
+}
+
+async function handleAdmin(
+  deps: Deps,
+  msg: IncomingMessage,
+  parsed: Extract<ParsedCommand, { kind: 'admin' }>,
+): Promise<Reply[]> {
+  // Auth gate. Silent drop in groups (don't advertise admin commands to members);
+  // explicit refusal in DMs from non-admins (they've already passed the DM allow
+  // check by virtue of having state, so a clear "no" is more honest than silence).
+  if (!isAdmin(msg.senderNumber)) {
+    log_.warn({ sender: msg.senderNumber, action: parsed.action }, 'admin command from non-admin');
+    if (msg.isGroup) return [];
+    return [reply(msg.senderJid, `Admin only.`)];
+  }
+
+  const replyTo = msg.fromJid;
+  const mentions = msg.isGroup ? [msg.senderJid] : undefined;
+  const prefix = msg.isGroup ? `@${msg.senderNumber} ` : '';
+
+  if (parsed.action === 'pending') {
+    let rows;
+    try {
+      rows = await deps.seerr.listPendingRequests(20);
+    } catch (e: any) {
+      log_.error({ err: e?.message }, 'listPendingRequests failed');
+      return [reply(replyTo, `${prefix}Couldn't fetch pending: ${e?.message ?? 'unknown error'}`, mentions)];
+    }
+    if (rows.length === 0) {
+      return [reply(replyTo, `${prefix}No pending requests.`, mentions)];
+    }
+    const lines = [`${prefix}*pending requests (${rows.length}):*`];
+    for (const r of rows) {
+      lines.push(`• \`${r.id}\` — *${r.title}* (${r.mediaType}) — by ${r.requestedBy}`);
+    }
+    lines.push('');
+    lines.push(`Reply \`!approve <id>\` or \`!deny <id>\`.`);
+    return [reply(replyTo, lines.join('\n'), mentions)];
+  }
+
+  if (parsed.action === 'approve' || parsed.action === 'deny') {
+    const id = parsed.requestId!;
+    try {
+      if (parsed.action === 'approve') await deps.seerr.approveRequest(id);
+      else await deps.seerr.declineRequest(id);
+    } catch (e: any) {
+      log_.error({ err: e?.message, id, action: parsed.action }, 'seerr decision failed');
+      return [reply(replyTo, `${prefix}Couldn't ${parsed.action} #${id}: ${e?.message ?? 'unknown error'}`, mentions)];
+    }
+    const verb = parsed.action === 'approve' ? 'approved' : 'denied';
+    return [reply(replyTo, `${prefix}Request #${id} ${verb} ✓`, mentions)];
+  }
+
+  if (parsed.action === 'shutdown') {
+    if (!deps.shutdown) {
+      return [reply(replyTo, `${prefix}Shutdown not wired (no service hook).`, mentions)];
+    }
+    // Send the ack first, THEN fire shutdown after a tick so the reply has a
+    // chance to leave the socket. NSSM will auto-restart in 5s.
+    setImmediate(() => {
+      log_.warn({ requester: msg.senderNumber }, 'shutdown requested by admin');
+      try { deps.shutdown!(); } catch (e: any) { log_.error({ err: e?.message }, 'shutdown hook threw'); }
+    });
+    return [reply(replyTo, `${prefix}Shutting down — service should auto-restart in ~5s.`, mentions)];
+  }
+
   return [];
 }
 
@@ -981,8 +1056,8 @@ function reply(to: string, text: string, mentions?: string[]): Reply {
   return r;
 }
 
-function helpText(): string {
-  return [
+function helpText(forAdmin: boolean): string {
+  const base = [
     '*whatsarr commands:*',
     '```',
     '!movie <title>             request a movie',
@@ -1010,5 +1085,18 @@ function helpText(): string {
     '!feedback the picker is great',
     '!issue ready DM never arrived for dune part two',
     '```',
-  ].join('\n');
+  ];
+  if (forAdmin) {
+    base.push(
+      '',
+      '*admin only:*',
+      '```',
+      '!pending                   list pending Seerr requests',
+      '!approve <id>              approve a pending request',
+      '!deny <id>                 decline a pending request',
+      '!shutdown                  graceful exit (service auto-restarts)',
+      '```',
+    );
+  }
+  return base.join('\n');
 }

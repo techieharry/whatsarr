@@ -88,6 +88,16 @@ export class Store {
         report        TEXT
       );
     `);
+    // Idempotent column adds for audit retry tracking (2026-05-26).
+    // SQLite has no IF NOT EXISTS for ALTER ADD COLUMN; check pragma_table_info.
+    const cols = this.db.prepare(`PRAGMA table_info(audit)`).all() as any[];
+    const have = new Set(cols.map(c => c.name));
+    if (!have.has('retry_attempts')) {
+      this.db.exec(`ALTER TABLE audit ADD COLUMN retry_attempts INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!have.has('last_retry_at')) {
+      this.db.exec(`ALTER TABLE audit ADD COLUMN last_retry_at INTEGER`);
+    }
   }
 
   enqueuePending(target: string, text: string, mentions?: string[]): number {
@@ -262,6 +272,59 @@ export class Store {
        ORDER BY ts DESC
        LIMIT ?`,
     ).all(senderNumber, limit) as any;
+  }
+
+  // Failed-request retry queue. Returns Whatsarr-originated audit rows whose
+  // Seerr request landed as 'failed', have remaining attempts, and whose last
+  // retry (if any) was far enough ago given exponential-backoff per-attempt.
+  // Caller passes the schedule (ms-per-attempt-index, 0-indexed) so the policy
+  // stays config-driven.
+  listFailedForRetry(maxAttempts: number, backoffSchedule: number[]): { auditId: number; seerrRequestId: number; attempts: number; senderJid: string; senderNumber: string; groupJid: string | null; display: string }[] {
+    const rows = this.db.prepare(
+      `SELECT id, seerr_request_id, retry_attempts, last_retry_at,
+              sender_jid, sender_number, group_jid, command
+       FROM audit
+       WHERE status = 'failed'
+         AND seerr_request_id IS NOT NULL
+         AND retry_attempts < ?
+       ORDER BY ts ASC`,
+    ).all(maxAttempts) as any[];
+    const now = Date.now();
+    const out: { auditId: number; seerrRequestId: number; attempts: number; senderJid: string; senderNumber: string; groupJid: string | null; display: string }[] = [];
+    for (const r of rows) {
+      const attempts = Number(r.retry_attempts ?? 0);
+      const backoff = backoffSchedule[Math.min(attempts, backoffSchedule.length - 1)] ?? 0;
+      if (r.last_retry_at && now - Number(r.last_retry_at) < backoff) continue;
+      out.push({
+        auditId: Number(r.id),
+        seerrRequestId: Number(r.seerr_request_id),
+        attempts,
+        senderJid: r.sender_jid,
+        senderNumber: r.sender_number,
+        groupJid: r.group_jid ?? null,
+        display: String(r.command ?? ''),
+      });
+    }
+    return out;
+  }
+
+  // After a successful /retry call. We optimistically flip status back to
+  // 'queued'; if Seerr fails it again the webhook + audit reconciliation will
+  // restore 'failed' on the next pass.
+  markRetrySucceeded(auditId: number): void {
+    this.db.prepare(
+      `UPDATE audit SET status = 'queued', retry_attempts = retry_attempts + 1,
+                        last_retry_at = ? WHERE id = ?`,
+    ).run(Date.now(), auditId);
+  }
+
+  // After a failed /retry call (network error, 404, etc.). Bumps attempt count
+  // without changing status, so the row remains eligible for the next pass —
+  // up to max_attempts.
+  markRetryFailed(auditId: number): void {
+    this.db.prepare(
+      `UPDATE audit SET retry_attempts = retry_attempts + 1, last_retry_at = ? WHERE id = ?`,
+    ).run(Date.now(), auditId);
   }
 
   findRequester(seerrMediaType: string, seerrMediaId: number): { senderJid: string; senderNumber: string; groupJid: string | null } | null {

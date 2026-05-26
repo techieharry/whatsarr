@@ -10,6 +10,8 @@ export type Category =
   | 'anime'
   | 'animated';
 
+export type AdminAction = 'approve' | 'deny' | 'pending' | 'shutdown';
+
 export type ParsedCommand =
   | { kind: 'request'; mediaTypeHint: MediaTypeHint; category: Category | null; title: string }
   | { kind: 'status' }
@@ -18,6 +20,7 @@ export type ParsedCommand =
   | { kind: 'sync' }
   | { kind: 'feedback'; body: string }
   | { kind: 'issue'; body: string }
+  | { kind: 'admin'; action: AdminAction; requestId: number | null }
   | { kind: 'incomplete'; cmd: string; reason: string }
   | { kind: 'unknown'; reason: string };
 
@@ -63,6 +66,21 @@ export function parse(input: string, prefix = '!'): ParsedCommand {
     const body = rest.join(' ').trim();
     if (!body) return { kind: 'incomplete', cmd: 'issue', reason: 'issue needs a description' };
     return { kind: 'issue', body };
+  }
+
+  // Admin commands. Caller MUST check isAdmin() before executing.
+  if (cmd === 'pending') return { kind: 'admin', action: 'pending', requestId: null };
+  if (cmd === 'shutdown' || cmd === 'restart') {
+    return { kind: 'admin', action: 'shutdown', requestId: null };
+  }
+  if (cmd === 'approve' || cmd === 'deny' || cmd === 'decline') {
+    const action: AdminAction = cmd === 'approve' ? 'approve' : 'deny';
+    if (rest.length === 0) return { kind: 'incomplete', cmd, reason: `${cmd} needs a request id` };
+    const id = Number.parseInt(rest[0]!, 10);
+    if (!Number.isFinite(id) || id < 1) {
+      return { kind: 'incomplete', cmd, reason: `${cmd} needs a numeric request id` };
+    }
+    return { kind: 'admin', action, requestId: id };
   }
 
   let mediaTypeHint: MediaTypeHint;

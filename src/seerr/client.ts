@@ -161,6 +161,53 @@ export async function getTvDetails(tmdbId: number): Promise<TvDetails | null> {
   }
 }
 
+export type PendingRequest = {
+  id: number;
+  status: number;          // 1 pending, 2 approved, 3 declined
+  mediaType: 'movie' | 'tv';
+  tmdbId: number;
+  title: string;           // best-effort, "Unknown" if Seerr returns no media metadata
+  requestedBy: string;     // display name or username
+  createdAt: string;       // ISO timestamp
+};
+
+// Seerr's request status enum on the request object (NOT the mediaInfo enum):
+// 1 PENDING_APPROVAL, 2 APPROVED, 3 DECLINED. We only list status=1.
+export async function listPendingRequests(limit = 20): Promise<PendingRequest[]> {
+  const j = await call(`/api/v1/request?take=${limit}&filter=pending&sort=added`);
+  const out: PendingRequest[] = [];
+  for (const r of j?.results ?? []) {
+    const m = r.media ?? {};
+    const tmdbId = Number(m.tmdbId ?? 0);
+    out.push({
+      id: Number(r.id),
+      status: Number(r.status ?? 0),
+      mediaType: (m.mediaType === 'tv' ? 'tv' : 'movie'),
+      tmdbId,
+      title: String(m.title ?? m.name ?? 'Unknown'),
+      requestedBy: String(r.requestedBy?.displayName ?? r.requestedBy?.username ?? '?'),
+      createdAt: String(r.createdAt ?? ''),
+    });
+  }
+  return out;
+}
+
+// Seerr decision endpoints. Both return the updated request object on success.
+export async function approveRequest(id: number): Promise<{ id: number }> {
+  return call(`/api/v1/request/${id}/approve`, { method: 'POST' });
+}
+
+export async function declineRequest(id: number): Promise<{ id: number }> {
+  return call(`/api/v1/request/${id}/decline`, { method: 'POST' });
+}
+
+// Re-fires Sonarr/Radarr push for a Failed request. Seerr sets status back to
+// APPROVED and re-runs the create-series call, so transient skyhook timeouts
+// can succeed on a subsequent attempt.
+export async function retryRequest(id: number): Promise<{ id: number }> {
+  return call(`/api/v1/request/${id}/retry`, { method: 'POST' });
+}
+
 export async function createRequest(args: CreateRequestArgs): Promise<{ id: number }> {
   const body: Record<string, unknown> = {
     mediaType: args.mediaType,

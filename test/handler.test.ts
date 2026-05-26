@@ -4,7 +4,7 @@ import { strict as assert } from 'node:assert';
 // Stub config BEFORE importing handler (which imports config)
 process.env.SEERR_URL = 'http://stub';
 process.env.SEERR_API_KEY = 'stub';
-process.env.ALLOWED_GROUPS = '120363111111111111@g.us,120363222222222222@g.us';
+process.env.ALLOWED_GROUPS = '120363111111111111@g.us,120363111111111112@g.us';
 process.env.ADMIN_NUMBERS = '+15555550100';
 process.env.COMMAND_PREFIX = '!';
 process.env.REQUESTS_PER_DAY = '5';
@@ -26,6 +26,10 @@ function fakeSeerr(opts: { searchResults?: any[]; createRequestId?: number; thro
     status: async () => ({ version: '3.2.0', commitTag: 'x', updateAvailable: false }),
     getMediaInfo: async (mt: string, id: number) => opts.mediaInfo ? opts.mediaInfo(mt, id) : null,
     getTvDetails: async (id: number) => opts.tvDetails ? opts.tvDetails(id) : { numberOfSeasons: 1, seasons: [{ seasonNumber: 1, episodeCount: 10 }] },
+    listPendingRequests: async () => [],
+    approveRequest: async (id: number) => ({ id }),
+    declineRequest: async (id: number) => ({ id }),
+    retryRequest: async (id: number) => ({ id }),
   };
 }
 

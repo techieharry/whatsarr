@@ -19,7 +19,15 @@ const ADMIN_JID = '15555550100@s.whatsapp.net';
 const USER_JID = '15551234567@s.whatsapp.net';
 const USER_NUM = '15551234567';
 
-function fakeSeerr(opts: { searchResults?: any[]; createRequestId?: number; tvDetails?: (id: number) => any; throwOnCreate?: boolean } = {}) {
+function fakeSeerr(opts: {
+  searchResults?: any[];
+  createRequestId?: number;
+  tvDetails?: (id: number) => any;
+  throwOnCreate?: boolean;
+  pending?: any[];
+  approveCalls?: number[];
+  declineCalls?: number[];
+} = {}) {
   return {
     search: async () => opts.searchResults ?? [],
     createRequest: async () => {
@@ -29,6 +37,10 @@ function fakeSeerr(opts: { searchResults?: any[]; createRequestId?: number; tvDe
     status: async () => ({ version: '3.2.0', commitTag: 'x', updateAvailable: false }),
     getMediaInfo: async () => null,
     getTvDetails: async (id: number) => opts.tvDetails ? opts.tvDetails(id) : { numberOfSeasons: 5, seasons: [{ seasonNumber: 1, episodeCount: 10 }] },
+    listPendingRequests: async () => opts.pending ?? [],
+    approveRequest: async (id: number) => { opts.approveCalls?.push(id); return { id }; },
+    declineRequest: async (id: number) => { opts.declineCalls?.push(id); return { id }; },
+    retryRequest: async (id: number) => ({ id }),
   };
 }
 function s() { return new Store(':memory:'); }
@@ -99,6 +111,102 @@ test('parser: !issue <body>', () => {
 test('parser: !bug / !report aliases for issue', () => {
   assert.equal(parse('!bug X').kind, 'issue');
   assert.equal(parse('!report Y').kind, 'issue');
+});
+
+test('parser: !sync / !syncstatus aliases', () => {
+  assert.deepEqual(parse('!sync'), { kind: 'sync' });
+  assert.deepEqual(parse('!syncstatus'), { kind: 'sync' });
+});
+
+// ---------- !sync handler ----------
+
+function fakeSyncthing(opts: { configured?: boolean; completion?: any; status?: any; throwOn?: 'completion' | 'status' } = {}) {
+  return {
+    isConfigured: () => opts.configured !== false,
+    getCompletion: async () => {
+      if (opts.throwOn === 'completion') throw new Error('boom completion');
+      return opts.completion ?? { completion: 100, needBytes: 0, needItems: 0, needDeletes: 0, globalBytes: 1024 * 1024 * 1024 * 1024 };
+    },
+    getFolderStatus: async () => {
+      if (opts.throwOn === 'status') throw new Error('boom status');
+      return opts.status ?? { state: 'idle', stateChanged: '', globalBytes: 1024 * 1024 * 1024 * 1024, globalFiles: 100, inSyncBytes: 1024 * 1024 * 1024 * 1024, inSyncFiles: 100, needBytes: 0, needFiles: 0, needDeletes: 0, errors: 0 };
+    },
+  };
+}
+
+test('!sync: when remote is at 100% → "in sync ✓"', async () => {
+  const store = s();
+  const replies = await handleMessage(
+    { store, seerr: fakeSeerr(), syncthing: fakeSyncthing() },
+    { fromJid: ALLOWED_GROUP, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!sync', isGroup: true },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /in sync ✓/);
+  assert.match(replies[0]!.text, /1\.00 TB/);
+  store.close();
+});
+
+test('!sync: when remote has bytes pending → percent + human-readable pending', async () => {
+  const store = s();
+  const replies = await handleMessage(
+    { store, seerr: fakeSeerr(), syncthing: fakeSyncthing({
+      completion: { completion: 99.43, needBytes: 74_000_000_000, needItems: 19, needDeletes: 0, globalBytes: 13_000_000_000_000 },
+    }) },
+    { fromJid: ALLOWED_GROUP, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!sync', isGroup: true },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /99\.43%/);
+  assert.match(replies[0]!.text, /68\.92 GB|68\.91 GB|69 GB|68\.\d+ GB/);  // 74_000_000_000 bytes ≈ 68.9 GB (binary)
+  assert.match(replies[0]!.text, /19 items pending/);
+  store.close();
+});
+
+test('!sync: when syncthing not configured → graceful message', async () => {
+  const store = s();
+  const replies = await handleMessage(
+    { store, seerr: fakeSeerr(), syncthing: fakeSyncthing({ configured: false }) },
+    { fromJid: ALLOWED_GROUP, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!sync', isGroup: true },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /not configured/);
+  store.close();
+});
+
+test('!sync: when syncthing unreachable → graceful error', async () => {
+  const store = s();
+  const replies = await handleMessage(
+    { store, seerr: fakeSeerr(), syncthing: fakeSyncthing({ throwOn: 'completion' }) },
+    { fromJid: ALLOWED_GROUP, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!sync', isGroup: true },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /unreachable/);
+  store.close();
+});
+
+test('!sync: errors > 0 → adds local-error callout', async () => {
+  const store = s();
+  const replies = await handleMessage(
+    { store, seerr: fakeSeerr(), syncthing: fakeSyncthing({
+      completion: { completion: 50, needBytes: 1_000_000_000, needItems: 5, needDeletes: 0, globalBytes: 2_000_000_000 },
+      status: { state: 'syncing', stateChanged: '', globalBytes: 2_000_000_000, globalFiles: 10, inSyncBytes: 1_000_000_000, inSyncFiles: 5, needBytes: 1_000_000_000, needFiles: 5, needDeletes: 0, errors: 3 },
+    }) },
+    { fromJid: ALLOWED_GROUP, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!sync', isGroup: true },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /50\.00%/);
+  assert.match(replies[0]!.text, /local has 3 errors/);
+  store.close();
+});
+
+test('!sync: works in DM (admin)', async () => {
+  const store = s();
+  const replies = await handleMessage(
+    { store, seerr: fakeSeerr(), syncthing: fakeSyncthing() },
+    { fromJid: ADMIN_JID, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!sync', isGroup: false },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /in sync/);
+  store.close();
 });
 
 // ---------- multi-select flow ----------
@@ -342,5 +450,267 @@ test('store.markPendingFailed + reapDeadPending drops after maxAttempts', () => 
   const reaped = store.reapDeadPending(5);
   assert.equal(reaped, 1);
   assert.equal(store.countPending(), 0);
+  store.close();
+});
+
+// ---------- admin commands ----------
+
+test('parser: !pending → admin/pending', () => {
+  const p = parse('!pending');
+  assert.deepEqual(p, { kind: 'admin', action: 'pending', requestId: null });
+});
+test('parser: !approve 42 → admin/approve', () => {
+  const p = parse('!approve 42');
+  assert.deepEqual(p, { kind: 'admin', action: 'approve', requestId: 42 });
+});
+test('parser: !deny 7 → admin/deny', () => {
+  const p = parse('!deny 7');
+  assert.deepEqual(p, { kind: 'admin', action: 'deny', requestId: 7 });
+});
+test('parser: !decline 7 aliases !deny', () => {
+  const p = parse('!decline 7');
+  assert.deepEqual(p, { kind: 'admin', action: 'deny', requestId: 7 });
+});
+test('parser: !shutdown → admin/shutdown', () => {
+  const p = parse('!shutdown');
+  assert.deepEqual(p, { kind: 'admin', action: 'shutdown', requestId: null });
+});
+test('parser: !restart aliases !shutdown', () => {
+  const p = parse('!restart');
+  assert.deepEqual(p, { kind: 'admin', action: 'shutdown', requestId: null });
+});
+test('parser: !approve without id → incomplete', () => {
+  const p = parse('!approve');
+  assert.equal(p.kind, 'incomplete');
+});
+test('parser: !approve garbage → incomplete', () => {
+  const p = parse('!approve foo');
+  assert.equal(p.kind, 'incomplete');
+});
+
+test('admin: !pending from non-admin DM → "Admin only."', async () => {
+  const store = s();
+  store.setState(USER_JID, { awaiting: 'confirm', payload: {}, expiresAt: Date.now() + 60000 });  // grant DM allowance
+  const seerr = fakeSeerr({ pending: [{ id: 1, status: 1, mediaType: 'movie', tmdbId: 1, title: 'X', requestedBy: 'u', createdAt: '' }] });
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: USER_JID, senderJid: USER_JID, senderNumber: USER_NUM, text: '!pending', isGroup: false },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /Admin only/);
+  store.close();
+});
+
+test('admin: !pending from admin → formatted list', async () => {
+  const store = s();
+  const seerr = fakeSeerr({
+    pending: [
+      { id: 17, status: 1, mediaType: 'movie', tmdbId: 11, title: 'Dune', requestedBy: 'alice', createdAt: '' },
+      { id: 18, status: 1, mediaType: 'tv', tmdbId: 22, title: 'Severance', requestedBy: 'bob', createdAt: '' },
+    ],
+  });
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: ADMIN_JID, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!pending', isGroup: false },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /pending requests \(2\)/);
+  assert.match(replies[0]!.text, /`17`.*Dune.*movie.*alice/);
+  assert.match(replies[0]!.text, /`18`.*Severance.*tv.*bob/);
+  store.close();
+});
+
+test('admin: !pending in allowed group from non-admin → silent drop', async () => {
+  const store = s();
+  const seerr = fakeSeerr({ pending: [{ id: 1, status: 1, mediaType: 'movie', tmdbId: 1, title: 'X', requestedBy: 'u', createdAt: '' }] });
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: ALLOWED_GROUP, senderJid: USER_JID, senderNumber: USER_NUM, text: '!pending', isGroup: true },
+  );
+  assert.deepEqual(replies, []);
+  store.close();
+});
+
+test('admin: !approve 42 calls seerr.approveRequest(42)', async () => {
+  const store = s();
+  const approveCalls: number[] = [];
+  const seerr = fakeSeerr({ approveCalls });
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: ADMIN_JID, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!approve 42', isGroup: false },
+  );
+  assert.deepEqual(approveCalls, [42]);
+  assert.match(replies[0]!.text, /#42 approved/);
+  store.close();
+});
+
+test('admin: !deny 7 calls seerr.declineRequest(7)', async () => {
+  const store = s();
+  const declineCalls: number[] = [];
+  const seerr = fakeSeerr({ declineCalls });
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: ADMIN_JID, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!deny 7', isGroup: false },
+  );
+  assert.deepEqual(declineCalls, [7]);
+  assert.match(replies[0]!.text, /#7 denied/);
+  store.close();
+});
+
+test('admin: !shutdown without shutdown hook → "not wired" reply', async () => {
+  const store = s();
+  const seerr = fakeSeerr();
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: ADMIN_JID, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!shutdown', isGroup: false },
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /not wired/i);
+  store.close();
+});
+
+test('admin: !shutdown with hook → acks then fires hook', async () => {
+  const store = s();
+  let fired = false;
+  const seerr = fakeSeerr();
+  const replies = await handleMessage(
+    { store, seerr, shutdown: () => { fired = true; } } as any,
+    { fromJid: ADMIN_JID, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!shutdown', isGroup: false },
+  );
+  assert.match(replies[0]!.text, /Shutting down/);
+  // hook fires on setImmediate; wait one microtask
+  await new Promise(r => setImmediate(r));
+  assert.equal(fired, true);
+  store.close();
+});
+
+test('admin: !help from admin includes admin section', async () => {
+  const store = s();
+  const seerr = fakeSeerr();
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: ADMIN_JID, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!help', isGroup: false },
+  );
+  assert.match(replies[0]!.text, /admin only:/);
+  assert.match(replies[0]!.text, /!approve <id>/);
+  store.close();
+});
+
+test('admin: !help from non-admin omits admin section', async () => {
+  const store = s();
+  store.setState(USER_JID, { awaiting: 'confirm', payload: {}, expiresAt: Date.now() + 60000 });
+  const seerr = fakeSeerr();
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: USER_JID, senderJid: USER_JID, senderNumber: USER_NUM, text: '!help', isGroup: false },
+  );
+  assert.doesNotMatch(replies[0]!.text, /admin only:/);
+  store.close();
+});
+
+// ---------- failed-request retry loop ----------
+
+function failedAuditFixture(store: any, opts: { senderJid?: string; senderNumber?: string; seerrId?: number } = {}) {
+  const id = store.audit({
+    senderJid: opts.senderJid ?? USER_JID,
+    senderNumber: opts.senderNumber ?? USER_NUM,
+    groupJid: null,
+    command: 'movie test',
+    resolvedRoute: '/media/movies/Western',
+    seerrMediaType: 'movie',
+    seerrMediaId: 99,
+    seerrRequestId: opts.seerrId ?? 555,
+    status: 'queued',
+  });
+  store.updateAudit(id, { status: 'failed' });
+  return id;
+}
+
+test('retry: listFailedForRetry returns failed rows with no retries yet', () => {
+  const store = s();
+  failedAuditFixture(store);
+  const list = store.listFailedForRetry(3, [60_000, 5*60_000, 30*60_000]);
+  assert.equal(list.length, 1);
+  assert.equal(list[0]!.seerrRequestId, 555);
+  assert.equal(list[0]!.attempts, 0);
+  store.close();
+});
+
+test('retry: listFailedForRetry skips rows still in backoff window', () => {
+  const store = s();
+  const id = failedAuditFixture(store);
+  store.markRetryFailed(id);  // attempts=1, last_retry_at=now
+  const list = store.listFailedForRetry(3, [60_000, 5*60_000, 30*60_000]);
+  assert.equal(list.length, 0);  // backoff[1] = 5min, just retried
+  store.close();
+});
+
+test('retry: listFailedForRetry skips rows that exhausted maxAttempts', () => {
+  const store = s();
+  const id = failedAuditFixture(store);
+  for (let i = 0; i < 3; i++) store.markRetryFailed(id);
+  const list = store.listFailedForRetry(3, [60_000, 5*60_000, 30*60_000]);
+  assert.equal(list.length, 0);
+  store.close();
+});
+
+test('retry: listFailedForRetry skips rows without seerr_request_id', () => {
+  const store = s();
+  store.audit({
+    senderJid: USER_JID, senderNumber: USER_NUM, groupJid: null,
+    command: 'movie x', status: 'queued', seerrRequestId: null,
+  });
+  // Find that row and mark failed
+  const rows = store.getUserRequests(USER_NUM, 5);
+  assert.equal(rows.length, 1);
+  // Need to update via audit id — fixture audit returns id; query for it
+  const auditRow = (store as any).db.prepare('SELECT id FROM audit WHERE sender_number = ?').get(USER_NUM) as any;
+  store.updateAudit(auditRow.id, { status: 'failed' });
+  const list = store.listFailedForRetry(3, [60_000]);
+  assert.equal(list.length, 0);
+  store.close();
+});
+
+test('retry: markRetrySucceeded flips status to queued and bumps attempts', () => {
+  const store = s();
+  const id = failedAuditFixture(store);
+  store.markRetrySucceeded(id);
+  const row = (store as any).db.prepare('SELECT status, retry_attempts FROM audit WHERE id = ?').get(id) as any;
+  assert.equal(row.status, 'queued');
+  assert.equal(row.retry_attempts, 1);
+  store.close();
+});
+
+test('retry: markRetryFailed bumps attempts without flipping status', () => {
+  const store = s();
+  const id = failedAuditFixture(store);
+  store.markRetryFailed(id);
+  const row = (store as any).db.prepare('SELECT status, retry_attempts FROM audit WHERE id = ?').get(id) as any;
+  assert.equal(row.status, 'failed');
+  assert.equal(row.retry_attempts, 1);
+  store.close();
+});
+
+test('retry: backoff schedule honored — second retry waits 5min', () => {
+  const store = s();
+  const id = failedAuditFixture(store);
+  // First retry — immediate
+  let list = store.listFailedForRetry(3, [60_000, 5*60_000, 30*60_000]);
+  assert.equal(list.length, 1);
+  store.markRetrySucceeded(id);  // attempts=1
+
+  // Same row was just flipped to 'queued', won't appear in list. Simulate
+  // second Failed cycle: flip back to 'failed' manually.
+  store.updateAudit(id, { status: 'failed' });
+
+  // After 1 attempt, backoff[1] = 5min. We just retried; should be in backoff.
+  list = store.listFailedForRetry(3, [60_000, 5*60_000, 30*60_000]);
+  assert.equal(list.length, 0);
+
+  // Backdate last_retry_at by 6 min — should now be eligible.
+  (store as any).db.prepare('UPDATE audit SET last_retry_at = ? WHERE id = ?').run(Date.now() - 6 * 60_000, id);
+  list = store.listFailedForRetry(3, [60_000, 5*60_000, 30*60_000]);
+  assert.equal(list.length, 1);
+  assert.equal(list[0]!.attempts, 1);
   store.close();
 });
