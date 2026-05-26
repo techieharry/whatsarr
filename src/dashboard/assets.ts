@@ -5,30 +5,32 @@ export const INDEX_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
 <meta name="color-scheme" content="dark light" />
+<meta name="description" content="whatsarr operator dashboard — WhatsApp to Seerr bridge audit, queue, and admin pane." />
 <title>whatsarr</title>
 <link rel="stylesheet" href="/dashboard/app.css" />
 </head>
 <body>
+<a href="#main" class="skip-link">skip to main content</a>
 <header class="topbar">
   <div class="brand">whatsarr</div>
-  <nav class="tabs" role="tablist">
-    <a class="tab" data-tab="overview"  href="#overview">overview</a>
-    <a class="tab" data-tab="requests"  href="#requests">requests</a>
-    <a class="tab" data-tab="pending"   href="#pending">pending</a>
-    <a class="tab" data-tab="syncthing" href="#syncthing">syncthing</a>
-    <a class="tab" data-tab="feedback"  href="#feedback">feedback</a>
-    <a class="tab" data-tab="tasks"     data-write-only href="#tasks" hidden>tasks</a>
+  <nav class="tabs" role="tablist" aria-label="dashboard sections">
+    <a class="tab" data-tab="overview"  href="#overview"  role="tab" aria-controls="panel-overview"  id="tab-overview"  aria-selected="true"  tabindex="0">overview</a>
+    <a class="tab" data-tab="requests"  href="#requests"  role="tab" aria-controls="panel-requests"  id="tab-requests"  aria-selected="false" tabindex="-1">requests</a>
+    <a class="tab" data-tab="pending"   href="#pending"   role="tab" aria-controls="panel-pending"   id="tab-pending"   aria-selected="false" tabindex="-1">pending</a>
+    <a class="tab" data-tab="syncthing" href="#syncthing" role="tab" aria-controls="panel-syncthing" id="tab-syncthing" aria-selected="false" tabindex="-1">syncthing</a>
+    <a class="tab" data-tab="feedback"  href="#feedback"  role="tab" aria-controls="panel-feedback"  id="tab-feedback"  aria-selected="false" tabindex="-1">feedback</a>
+    <a class="tab" data-tab="tasks"     data-write-only href="#tasks" role="tab" aria-controls="panel-tasks" id="tab-tasks" aria-selected="false" tabindex="-1" hidden>tasks</a>
   </nav>
-  <div class="status">
-    <span id="conn-dot" class="dot dot-unknown" title="connection"></span>
+  <div class="status" role="status" aria-live="polite" aria-atomic="false">
+    <span id="conn-dot" class="dot dot-unknown" role="img" aria-label="connection unknown"></span>
     <span id="uptime" class="uptime">—</span>
     <span id="counters" class="counters"></span>
   </div>
 </header>
-<div id="conn-lost" class="banner" hidden>dashboard cannot reach the bot. retrying…</div>
+<div id="conn-lost" class="banner" role="alert" hidden>dashboard cannot reach the bot. retrying…</div>
 
-<main>
-  <section id="panel-overview" class="panel" hidden>
+<main id="main">
+  <section id="panel-overview" class="panel" role="tabpanel" aria-labelledby="tab-overview" hidden>
     <div class="overview-grid">
       <div class="card">
         <h2>validation</h2>
@@ -50,7 +52,7 @@ export const INDEX_HTML = `<!doctype html>
     </div>
   </section>
 
-  <section id="panel-requests" class="panel" hidden>
+  <section id="panel-requests" class="panel" role="tabpanel" aria-labelledby="tab-requests" hidden>
     <div class="filterbar">
       <label>status
         <select id="f-status">
@@ -83,7 +85,7 @@ export const INDEX_HTML = `<!doctype html>
     </div>
   </section>
 
-  <section id="panel-pending" class="panel" hidden>
+  <section id="panel-pending" class="panel" role="tabpanel" aria-labelledby="tab-pending" hidden>
     <div class="scroll-x">
       <table id="pending-table" class="data">
         <thead><tr><th>id</th><th>target</th><th>text</th><th>attempts</th><th>last error</th><th class="th-actions" data-write-only hidden>actions</th></tr></thead>
@@ -93,7 +95,7 @@ export const INDEX_HTML = `<!doctype html>
     <p id="pending-meta" class="meta">—</p>
   </section>
 
-  <section id="panel-tasks" class="panel" data-write-only hidden>
+  <section id="panel-tasks" class="panel" role="tabpanel" aria-labelledby="tab-tasks" data-write-only hidden>
     <div class="card">
       <h2>run command</h2>
       <div id="tasks-commands" class="task-buttons"></div>
@@ -116,11 +118,11 @@ export const INDEX_HTML = `<!doctype html>
     </div>
   </section>
 
-  <section id="panel-syncthing" class="panel" hidden>
+  <section id="panel-syncthing" class="panel" role="tabpanel" aria-labelledby="tab-syncthing" hidden>
     <div id="syncthing-body"></div>
   </section>
 
-  <section id="panel-feedback" class="panel" hidden>
+  <section id="panel-feedback" class="panel" role="tabpanel" aria-labelledby="tab-feedback" hidden>
     <nav class="subtabs">
       <a class="subtab" data-kind="feedback" href="#feedback">feedback</a>
       <a class="subtab" data-kind="issue" href="#feedback/issue">issue</a>
@@ -292,7 +294,10 @@ export const APP_JS = String.raw`(function () {
     }
     var tabs = document.querySelectorAll('.tab');
     for (var j = 0; j < tabs.length; j++) {
-      tabs[j].classList.toggle('active', tabs[j].getAttribute('data-tab') === name);
+      var isActive = tabs[j].getAttribute('data-tab') === name;
+      tabs[j].classList.toggle('active', isActive);
+      tabs[j].setAttribute('aria-selected', isActive ? 'true' : 'false');
+      tabs[j].setAttribute('tabindex', isActive ? '0' : '-1');
     }
     document.title = name === 'overview' ? 'whatsarr' : 'whatsarr — ' + name;
     if (name === 'feedback') {
@@ -310,7 +315,9 @@ export const APP_JS = String.raw`(function () {
     var dot = $('conn-dot');
     dot.classList.remove('dot-ok', 'dot-bad', 'dot-unknown');
     dot.classList.add(hb.connected ? 'dot-ok' : 'dot-bad');
-    dot.title = hb.connected ? 'baileys connected' : 'baileys disconnected';
+    var label = hb.connected ? 'baileys connected' : 'baileys disconnected';
+    dot.title = label;
+    dot.setAttribute('aria-label', label);
     $('uptime').textContent = fmtUptime(hb.uptimeSec);
     $('counters').textContent = 'pending ' + (hb.pendingCount || 0) + ' • retries ' + (hb.retryCount || 0);
   }
@@ -712,10 +719,32 @@ export const APP_JS = String.raw`(function () {
     });
   }
 
+  function wireTablistKeyboard() {
+    var tablist = document.querySelector('[role="tablist"]');
+    if (!tablist) return;
+    tablist.addEventListener('keydown', function (e) {
+      var key = e.key;
+      if (key !== 'ArrowLeft' && key !== 'ArrowRight' && key !== 'Home' && key !== 'End') return;
+      var visible = Array.from(tablist.querySelectorAll('[role="tab"]')).filter(function (t) { return !t.hasAttribute('hidden'); });
+      if (visible.length === 0) return;
+      var current = visible.indexOf(document.activeElement);
+      var next = current;
+      if (key === 'ArrowLeft')  next = (current <= 0) ? visible.length - 1 : current - 1;
+      if (key === 'ArrowRight') next = (current + 1) % visible.length;
+      if (key === 'Home')       next = 0;
+      if (key === 'End')        next = visible.length - 1;
+      e.preventDefault();
+      visible[next].focus();
+      var name = visible[next].getAttribute('data-tab');
+      if (name) location.hash = '#' + name;
+    });
+  }
+
   function start() {
     applyWriteFeatureFlag();
     wireFilters();
     wireTasks();
+    wireTablistKeyboard();
     window.addEventListener('hashchange', function () { showTab(activeTab()); });
     showTab(activeTab());
     pollHeartbeat();
@@ -758,6 +787,10 @@ export const APP_CSS = `:root {
     --fg: #1f2328;
     --fg-dim: #59636e;
     --grey: #afb8c1;
+    --accent: #0969da;
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --bad: #cf222e;
   }
 }
 * { box-sizing: border-box; }
@@ -862,6 +895,9 @@ table.data.clickable tbody tr:hover { background: var(--panel-2); }
 .task-form input { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: .3rem .5rem; font: inherit; min-width: 14rem; }
 
 .b-running { color: var(--accent); border-color: var(--accent); }
+
+.skip-link { position: absolute; top: -100px; left: 0; background: var(--accent); color: #fff; padding: .5rem 1rem; z-index: 100; }
+.skip-link:focus { top: 0; outline: 2px solid #fff; outline-offset: -4px; }
 
 .toasts { position: fixed; bottom: 1rem; right: 1rem; display: flex; flex-direction: column-reverse; gap: .35rem; z-index: 30; pointer-events: none; max-width: min(360px, 90vw); }
 .toast { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-left-width: 3px; border-radius: 4px; padding: .5rem .75rem; font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,.35); pointer-events: auto; opacity: 1; transition: opacity .2s ease; }
