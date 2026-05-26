@@ -87,6 +87,18 @@ export class Store {
         body          TEXT NOT NULL,
         report        TEXT
       );
+      CREATE TABLE IF NOT EXISTS commands (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          INTEGER NOT NULL,
+        name        TEXT NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'queued',
+        args_json   TEXT,
+        result      TEXT,
+        error       TEXT,
+        started_at  INTEGER,
+        finished_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_commands_status_ts ON commands(status, ts DESC);
     `);
     // Idempotent column adds for audit retry tracking (2026-05-26).
     // SQLite has no IF NOT EXISTS for ALTER ADD COLUMN; check pragma_table_info.
@@ -458,6 +470,81 @@ export class Store {
     ).get(seerrMediaType, seerrMediaId) as any;
     if (!row) return null;
     return { senderJid: row.sender_jid, senderNumber: row.sender_number, groupJid: row.group_jid };
+  }
+
+  findAuditBySeerrRequestId(seerrRequestId: number): { id: number; senderNumber: string; senderJid: string; groupJid: string | null; status: string } | null {
+    const row = this.db.prepare(
+      `SELECT id, sender_number AS senderNumber, sender_jid AS senderJid,
+              group_jid AS groupJid, status
+       FROM audit WHERE seerr_request_id = ? ORDER BY ts DESC, id DESC LIMIT 1`,
+    ).get(seerrRequestId) as any;
+    if (!row) return null;
+    return {
+      id: Number(row.id),
+      senderNumber: row.senderNumber,
+      senderJid: row.senderJid,
+      groupJid: row.groupJid ?? null,
+      status: row.status,
+    };
+  }
+
+  enqueueCommand(name: string, args?: Record<string, unknown>): number {
+    const r = this.db.prepare(
+      `INSERT INTO commands(ts, name, status, args_json)
+       VALUES (?, ?, 'queued', ?)`,
+    ).run(Date.now(), name, args ? JSON.stringify(args) : null);
+    return Number(r.lastInsertRowid);
+  }
+
+  markCommandRunning(id: number): void {
+    this.db.prepare(
+      `UPDATE commands SET status = 'running', started_at = ? WHERE id = ?`,
+    ).run(Date.now(), id);
+  }
+
+  completeCommand(id: number, result?: string): void {
+    this.db.prepare(
+      `UPDATE commands SET status = 'succeeded', finished_at = ?, result = ? WHERE id = ?`,
+    ).run(Date.now(), result ?? null, id);
+  }
+
+  failCommand(id: number, err: string): void {
+    this.db.prepare(
+      `UPDATE commands SET status = 'failed', finished_at = ?, error = ? WHERE id = ?`,
+    ).run(Date.now(), err, id);
+  }
+
+  listCommands(limit = 50): {
+    id: number;
+    ts: number;
+    name: string;
+    status: string;
+    argsJson: string | null;
+    result: string | null;
+    error: string | null;
+    startedAt: number | null;
+    finishedAt: number | null;
+  }[] {
+    const rows = this.db.prepare(
+      `SELECT id, ts, name, status, args_json AS argsJson, result, error,
+              started_at AS startedAt, finished_at AS finishedAt
+       FROM commands ORDER BY ts DESC, id DESC LIMIT ?`,
+    ).all(limit) as any[];
+    return rows.map(r => ({
+      id: Number(r.id),
+      ts: Number(r.ts),
+      name: r.name,
+      status: r.status,
+      argsJson: r.argsJson ?? null,
+      result: r.result ?? null,
+      error: r.error ?? null,
+      startedAt: r.startedAt != null ? Number(r.startedAt) : null,
+      finishedAt: r.finishedAt != null ? Number(r.finishedAt) : null,
+    }));
+  }
+
+  vacuum(): void {
+    this.db.exec('VACUUM');
   }
 
   close(): void {

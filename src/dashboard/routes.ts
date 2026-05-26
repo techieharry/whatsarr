@@ -4,6 +4,7 @@ import * as seerrModule from '../seerr/client.ts';
 import * as syncthingModule from '../syncthing/client.ts';
 import { runDiagnosis } from '../diagnostics.ts';
 import { INDEX_HTML, APP_JS, APP_CSS } from './assets.ts';
+import { isCommandName, runCommand, type CommandDeps } from './commands.ts';
 
 export type DashboardDeps = {
   store: Store;
@@ -11,15 +12,21 @@ export type DashboardDeps = {
   syncthing: typeof syncthingModule;
   getConnectionStatus: () => { connected: boolean; uptimeSec: number };
   syncthingFolders: string[];
+  send: (to: string, content: { text: string; mentions?: string[] }) => Promise<unknown>;
+  drainPending: () => Promise<void>;
+  reconnectWa: () => Promise<void>;
+  shutdown: () => void;
 };
 
 const BOOTSTRAP_PLACEHOLDER = '__WHATSARR_BOOTSTRAP__';
 
 const BOOTSTRAP_JSON = JSON.stringify({
   apiBase: '/api',
-  features: { writeActions: false },
+  features: { writeActions: true },
   pollIntervals: { heartbeat: 1000, active: 5000, static: 30000 },
 });
+
+const MAX_BODY_BYTES = 8 * 1024;
 
 export async function dashboardRoute(req: IM, res: ServerResponse, deps: DashboardDeps): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://x');
@@ -123,6 +130,108 @@ export async function dashboardRoute(req: IM, res: ServerResponse, deps: Dashboa
     return;
   }
 
+  if (req.method === 'GET' && path === '/api/tasks') {
+    sendJson(res, 200, { rows: deps.store.listCommands(50) });
+    return;
+  }
+
+  const seerrApprove = path.match(/^\/api\/seerr\/request\/(\d+)\/approve$/);
+  if (req.method === 'POST' && seerrApprove) {
+    const id = Number(seerrApprove[1]);
+    try {
+      await deps.seerr.approveRequest(id);
+      const audit = deps.store.findAuditBySeerrRequestId(id);
+      if (audit) deps.store.updateAudit(audit.id, { status: 'approved' });
+      sendJson(res, 200, { id, ok: true });
+    } catch (e: any) {
+      sendJson(res, 502, { id, error: e?.message ?? 'approve failed' });
+    }
+    return;
+  }
+
+  const seerrDeny = path.match(/^\/api\/seerr\/request\/(\d+)\/deny$/);
+  if (req.method === 'POST' && seerrDeny) {
+    const id = Number(seerrDeny[1]);
+    try {
+      await deps.seerr.declineRequest(id);
+      sendJson(res, 200, { id, ok: true });
+    } catch (e: any) {
+      sendJson(res, 502, { id, error: e?.message ?? 'deny failed' });
+    }
+    return;
+  }
+
+  const seerrRetry = path.match(/^\/api\/seerr\/request\/(\d+)\/retry$/);
+  if (req.method === 'POST' && seerrRetry) {
+    const id = Number(seerrRetry[1]);
+    try {
+      await deps.seerr.retryRequest(id);
+      const audit = deps.store.findAuditBySeerrRequestId(id);
+      if (audit) deps.store.markRetrySucceeded(audit.id);
+      sendJson(res, 200, { id, ok: true });
+    } catch (e: any) {
+      sendJson(res, 502, { id, error: e?.message ?? 'retry failed' });
+    }
+    return;
+  }
+
+  const pendingRetry = path.match(/^\/api\/pending\/(\d+)\/retry$/);
+  if (req.method === 'POST' && pendingRetry) {
+    const id = Number(pendingRetry[1]);
+    const row = deps.store.listPending(1000).find(r => r.id === id);
+    if (!row) {
+      sendJson(res, 404, { id, error: 'not found' });
+      return;
+    }
+    try {
+      await deps.send(row.targetJid, { text: row.text, mentions: row.mentions });
+      deps.store.deletePending(id);
+      sendJson(res, 200, { id, ok: true });
+    } catch (e: any) {
+      const msg = e?.message ?? 'send failed';
+      deps.store.markPendingFailed(id, msg);
+      sendJson(res, 502, { error: msg });
+    }
+    return;
+  }
+
+  const pendingDelete = path.match(/^\/api\/pending\/(\d+)\/delete$/);
+  if (req.method === 'POST' && pendingDelete) {
+    const id = Number(pendingDelete[1]);
+    deps.store.deletePending(id);
+    sendJson(res, 200, { id, deleted: true });
+    return;
+  }
+
+  if (req.method === 'POST' && path === '/api/commands') {
+    let body: unknown;
+    try {
+      body = await readJsonBody(req);
+    } catch (e: any) {
+      const status = e?.message === 'body too large' ? 413 : 400;
+      sendJson(res, status, { error: e?.message ?? 'invalid json' });
+      return;
+    }
+    const name = (body as any)?.name;
+    const args = (body as any)?.args;
+    if (typeof name !== 'string' || !isCommandName(name)) {
+      sendJson(res, 400, { error: 'unknown command' });
+      return;
+    }
+    const id = deps.store.enqueueCommand(name, args);
+    const cmdDeps: CommandDeps = {
+      store: deps.store,
+      seerr: deps.seerr,
+      send: deps.send,
+      drainPending: deps.drainPending,
+      reconnectWa: deps.reconnectWa,
+      shutdown: deps.shutdown,
+    };
+    queueMicrotask(() => { void runCommand(id, name, args, cmdDeps); });
+    sendJson(res, 202, { id, name, status: 'queued' });
+    return;
+  }
+
   res.writeHead(404, { 'content-type': 'text/plain' });
   res.end('not found');
 }
@@ -130,4 +239,26 @@ export async function dashboardRoute(req: IM, res: ServerResponse, deps: Dashboa
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
+}
+
+function readJsonBody(req: IM): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    let aborted = false;
+    req.on('data', c => {
+      if (aborted) return;
+      buf += c;
+      if (buf.length > MAX_BODY_BYTES) {
+        aborted = true;
+        reject(new Error('body too large'));
+      }
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      if (buf === '') { resolve(undefined); return; }
+      try { resolve(JSON.parse(buf)); }
+      catch { reject(new Error('invalid json')); }
+    });
+    req.on('error', reject);
+  });
 }

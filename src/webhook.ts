@@ -17,6 +17,9 @@ export type WebhookDeps = {
   seerr: typeof seerrModule;
   syncthing: typeof syncthingModule;
   getConnectionStatus: () => { connected: boolean; uptimeSec: number };
+  drainPending?: () => Promise<void>;
+  reconnectWa?: () => Promise<void>;
+  shutdown?: () => void;
 };
 
 export function startWebhook(deps: WebhookDeps): () => void {
@@ -70,6 +73,10 @@ export async function router(req: IM, res: ServerResponse, deps: WebhookDeps): P
       syncthing: deps.syncthing,
       getConnectionStatus: deps.getConnectionStatus,
       syncthingFolders: config.syncthing.folders,
+      send: (to, content) => deps.send(to, content),
+      drainPending: deps.drainPending ?? (async () => {}),
+      reconnectWa: deps.reconnectWa ?? (async () => {}),
+      shutdown: deps.shutdown ?? (() => {}),
     });
     return;
   }

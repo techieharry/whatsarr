@@ -16,13 +16,14 @@ const { Store } = await import('../src/state/store.ts');
 const { authGate, maybeSetTokenCookie } = await import('../src/dashboard/auth.ts');
 const { dashboardRoute } = await import('../src/dashboard/routes.ts');
 const { router } = await import('../src/webhook.ts');
+const { isCommandName, runCommand, COMMAND_NAMES } = await import('../src/dashboard/commands.ts');
 
 type MockReq = {
   url: string;
   method: string;
   headers: Record<string, string | string[] | undefined>;
   socket: { remoteAddress: string };
-  on?: (event: string, cb: (...args: any[]) => void) => void;
+  on: (event: string, cb: (...args: any[]) => void) => void;
 };
 
 type MockRes = {
@@ -35,13 +36,28 @@ type MockRes = {
   setHeader: (name: string, value: string) => void;
 };
 
-function mkReq(opts: Partial<MockReq> & { url: string; method?: string }): MockReq {
-  return {
+function mkReq(opts: Partial<MockReq> & { url: string; method?: string; body?: string }): MockReq {
+  const body = opts.body;
+  const listeners = new Map<string, ((...args: any[]) => void)[]>();
+  const req: MockReq = {
     url: opts.url,
     method: opts.method ?? 'GET',
     headers: opts.headers ?? {},
     socket: opts.socket ?? { remoteAddress: '10.0.0.1' },
+    on(event: string, cb: (...args: any[]) => void) {
+      const arr = listeners.get(event) ?? [];
+      arr.push(cb);
+      listeners.set(event, arr);
+      // Fire on next microtask after both 'data' and 'end' are wired.
+      queueMicrotask(() => {
+        if (event === 'data' && body !== undefined) cb(body);
+      });
+      queueMicrotask(() => queueMicrotask(() => {
+        if (event === 'end') cb();
+      }));
+    },
   };
+  return req;
 }
 
 function mkRes(): MockRes {
@@ -97,11 +113,14 @@ function fakeSyncthing(opts: { configured?: boolean; ping?: boolean; completion?
 
 function mkDeps(store: any, overrides: any = {}) {
   return {
-    send: async () => null,
+    send: overrides.send ?? (async () => null),
     store,
     seerr: overrides.seerr ?? fakeSeerr(),
     syncthing: overrides.syncthing ?? fakeSyncthing(),
     getConnectionStatus: overrides.getConnectionStatus ?? (() => ({ connected: true, uptimeSec: 42 })),
+    drainPending: overrides.drainPending ?? (async () => {}),
+    reconnectWa: overrides.reconnectWa ?? (async () => {}),
+    shutdown: overrides.shutdown ?? (() => {}),
   };
 }
 
@@ -543,7 +562,7 @@ test('router: /dashboard/ returns HTML with bootstrap injection', async () => {
   assert.match(res.headers['content-type'] ?? '', /text\/html/);
   assert.match(res.body, /window\.__WHATSARR__/);
   assert.match(res.body, /apiBase/);
-  assert.match(res.body, /writeActions/);
+  assert.match(res.body, /"writeActions":true/);
   assert.match(res.body, /pollIntervals/);
 });
 
@@ -600,6 +619,457 @@ test('dashboardRoute: unknown /api/* path falls through to 404', async () => {
     syncthing: fakeSyncthing(),
     getConnectionStatus: () => ({ connected: true, uptimeSec: 1 }),
     syncthingFolders: [],
+    send: async () => null,
+    drainPending: async () => {},
+    reconnectWa: async () => {},
+    shutdown: () => {},
   });
   assert.equal(res.statusCode, 404);
+});
+
+// ----------------- commands table CRUD -----------------
+
+test('store.enqueueCommand: returns id, row visible via listCommands', () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('vacuum_db');
+  assert.ok(id > 0);
+  const rows = store.listCommands();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.id, id);
+  assert.equal(rows[0]!.name, 'vacuum_db');
+  assert.equal(rows[0]!.status, 'queued');
+  assert.equal(rows[0]!.argsJson, null);
+});
+
+test('store.enqueueCommand: persists args as JSON', () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('send_test_dm', { to: '+1@s.whatsapp.net', text: 'hi' });
+  const rows = store.listCommands();
+  assert.equal(rows[0]!.id, id);
+  assert.equal(rows[0]!.argsJson, JSON.stringify({ to: '+1@s.whatsapp.net', text: 'hi' }));
+});
+
+test('store.markCommandRunning: flips status + sets started_at', () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('vacuum_db');
+  store.markCommandRunning(id);
+  const r = store.listCommands()[0]!;
+  assert.equal(r.status, 'running');
+  assert.equal(typeof r.startedAt, 'number');
+  assert.equal(r.finishedAt, null);
+});
+
+test('store.completeCommand: flips to succeeded + sets result + finished_at', () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('vacuum_db');
+  store.markCommandRunning(id);
+  store.completeCommand(id, 'ok');
+  const r = store.listCommands()[0]!;
+  assert.equal(r.status, 'succeeded');
+  assert.equal(r.result, 'ok');
+  assert.equal(typeof r.finishedAt, 'number');
+  assert.equal(r.error, null);
+});
+
+test('store.failCommand: flips to failed + records error', () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('vacuum_db');
+  store.markCommandRunning(id);
+  store.failCommand(id, 'boom');
+  const r = store.listCommands()[0]!;
+  assert.equal(r.status, 'failed');
+  assert.equal(r.error, 'boom');
+  assert.equal(typeof r.finishedAt, 'number');
+});
+
+test('store.listCommands: returns rows DESC ts', () => {
+  const store = new Store(':memory:');
+  store.enqueueCommand('vacuum_db');
+  store.enqueueCommand('drain_pending');
+  store.enqueueCommand('reconnect_wa');
+  const rows = store.listCommands();
+  assert.equal(rows.length, 3);
+  // Most recent first.
+  assert.equal(rows[0]!.name, 'reconnect_wa');
+  assert.equal(rows[2]!.name, 'vacuum_db');
+});
+
+test('store.findAuditBySeerrRequestId: returns null when no row', () => {
+  const store = new Store(':memory:');
+  assert.equal(store.findAuditBySeerrRequestId(999), null);
+});
+
+test('store.findAuditBySeerrRequestId: finds row + most recent on dup', () => {
+  const store = new Store(':memory:');
+  store.audit({ senderJid: 'a@s', senderNumber: '1', groupJid: 'g@g.us', command: 'old', seerrRequestId: 42, status: 'failed' });
+  const id2 = store.audit({ senderJid: 'b@s', senderNumber: '2', groupJid: null, command: 'new', seerrRequestId: 42, status: 'queued' });
+  const r = store.findAuditBySeerrRequestId(42);
+  assert.ok(r);
+  assert.equal(r!.id, id2);
+  assert.equal(r!.senderNumber, '2');
+  assert.equal(r!.groupJid, null);
+});
+
+// ----------------- commands runner -----------------
+
+test('isCommandName: validates name set', () => {
+  assert.ok(isCommandName('vacuum_db'));
+  assert.ok(isCommandName('reconnect_wa'));
+  assert.ok(isCommandName('drain_pending'));
+  assert.ok(isCommandName('send_test_dm'));
+  assert.ok(isCommandName('shutdown'));
+  assert.equal(isCommandName('eat_homework'), false);
+  assert.equal(isCommandName(''), false);
+});
+
+test('COMMAND_NAMES: covers documented set', () => {
+  assert.deepEqual(
+    [...COMMAND_NAMES].sort(),
+    ['drain_pending', 'reconnect_wa', 'send_test_dm', 'shutdown', 'vacuum_db'],
+  );
+});
+
+function mkCmdDeps(store: any, overrides: any = {}) {
+  return {
+    store,
+    seerr: overrides.seerr ?? fakeSeerr(),
+    send: overrides.send ?? (async () => null),
+    drainPending: overrides.drainPending ?? (async () => {}),
+    reconnectWa: overrides.reconnectWa ?? (async () => {}),
+    shutdown: overrides.shutdown ?? (() => {}),
+  } as any;
+}
+
+test('runCommand: reconnect_wa → succeeded, calls reconnectWa', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('reconnect_wa');
+  let called = false;
+  const deps = mkCmdDeps(store, { reconnectWa: async () => { called = true; } });
+  const status = await runCommand(id, 'reconnect_wa', undefined, deps);
+  assert.equal(status, 'succeeded');
+  assert.equal(called, true);
+  const r = store.listCommands()[0]!;
+  assert.equal(r.status, 'succeeded');
+  assert.equal(r.result, 'reconnect triggered');
+});
+
+test('runCommand: vacuum_db → succeeded, calls store.vacuum', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('vacuum_db');
+  const deps = mkCmdDeps(store);
+  const status = await runCommand(id, 'vacuum_db', undefined, deps);
+  assert.equal(status, 'succeeded');
+  const r = store.listCommands()[0]!;
+  assert.equal(r.result, 'db vacuumed');
+});
+
+test('runCommand: drain_pending → succeeded, calls drainPending', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('drain_pending');
+  let called = false;
+  const deps = mkCmdDeps(store, { drainPending: async () => { called = true; } });
+  const status = await runCommand(id, 'drain_pending', undefined, deps);
+  assert.equal(status, 'succeeded');
+  assert.equal(called, true);
+});
+
+test('runCommand: send_test_dm → succeeded, calls send', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('send_test_dm', { to: '+1@s.whatsapp.net', text: 'hi' });
+  let captured: any = null;
+  const deps = mkCmdDeps(store, {
+    send: async (to: string, content: any) => { captured = { to, content }; return null; },
+  });
+  const status = await runCommand(id, 'send_test_dm', { to: '+1@s.whatsapp.net', text: 'hi' }, deps);
+  assert.equal(status, 'succeeded');
+  assert.equal(captured.to, '+1@s.whatsapp.net');
+  assert.equal(captured.content.text, 'hi');
+  const r = store.listCommands()[0]!;
+  assert.equal(r.result, 'sent to +1@s.whatsapp.net');
+});
+
+test('runCommand: send_test_dm validates non-empty {to,text}', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('send_test_dm', {});
+  const deps = mkCmdDeps(store);
+  const status = await runCommand(id, 'send_test_dm', {}, deps);
+  assert.equal(status, 'failed');
+  const r = store.listCommands()[0]!;
+  assert.equal(r.status, 'failed');
+  assert.match(r.error ?? '', /non-empty/);
+});
+
+test('runCommand: shutdown → succeeded, calls shutdown after marking done', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('shutdown');
+  let shutdownAfterMarked = false;
+  const deps = mkCmdDeps(store, {
+    shutdown: () => {
+      const r = store.listCommands()[0]!;
+      if (r.status === 'succeeded') shutdownAfterMarked = true;
+    },
+  });
+  const status = await runCommand(id, 'shutdown', undefined, deps);
+  assert.equal(status, 'succeeded');
+  assert.equal(shutdownAfterMarked, true);
+  const r = store.listCommands()[0]!;
+  assert.equal(r.result, 'shutting down');
+});
+
+test('runCommand: failure path calls failCommand with error message', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueueCommand('reconnect_wa');
+  const deps = mkCmdDeps(store, {
+    reconnectWa: async () => { throw new Error('socket-stuck'); },
+  });
+  const status = await runCommand(id, 'reconnect_wa', undefined, deps);
+  assert.equal(status, 'failed');
+  const r = store.listCommands()[0]!;
+  assert.equal(r.status, 'failed');
+  assert.equal(r.error, 'socket-stuck');
+});
+
+// ----------------- write endpoints: /api/seerr/request/:id/* -----------------
+
+test('router: POST /api/seerr/request/:id/approve requires auth', async () => {
+  const store = new Store(':memory:');
+  const deps = mkDeps(store);
+  const req = mkReq({ url: '/api/seerr/request/42/approve', method: 'POST', socket: { remoteAddress: '10.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 401);
+});
+
+test('router: POST /api/seerr/request/:id/approve calls seerr.approveRequest + updates audit', async () => {
+  const store = new Store(':memory:');
+  const auditId = store.audit({ senderJid: 'a', senderNumber: '1', groupJid: null, command: '!movie x', seerrRequestId: 7, status: 'pending' });
+  let approvedWith: number | null = null;
+  const seerr = { ...fakeSeerr(), approveRequest: async (id: number) => { approvedWith = id; return { id }; } };
+  const deps = mkDeps(store, { seerr });
+  const req = mkReq({ url: '/api/seerr/request/7/approve', method: 'POST', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 200);
+  const j = JSON.parse(res.body);
+  assert.equal(j.id, 7);
+  assert.equal(j.ok, true);
+  assert.equal(approvedWith, 7);
+  // Audit row updated to 'approved'.
+  const row = store.listAudit().find(r => r.id === auditId)!;
+  assert.equal(row.status, 'approved');
+});
+
+test('router: POST /api/seerr/request/:id/deny calls seerr.declineRequest', async () => {
+  const store = new Store(':memory:');
+  let deniedWith: number | null = null;
+  const seerr = { ...fakeSeerr(), declineRequest: async (id: number) => { deniedWith = id; return { id }; } };
+  const deps = mkDeps(store, { seerr });
+  const req = mkReq({ url: '/api/seerr/request/9/deny', method: 'POST', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 200);
+  const j = JSON.parse(res.body);
+  assert.equal(j.id, 9);
+  assert.equal(deniedWith, 9);
+});
+
+test('router: POST /api/seerr/request/:id/retry calls seerr.retryRequest + marks audit retried', async () => {
+  const store = new Store(':memory:');
+  const auditId = store.audit({ senderJid: 'a', senderNumber: '1', groupJid: null, command: '!movie x', seerrRequestId: 11, status: 'failed' });
+  let retryWith: number | null = null;
+  const seerr = { ...fakeSeerr(), retryRequest: async (id: number) => { retryWith = id; return { id }; } };
+  const deps = mkDeps(store, { seerr });
+  const req = mkReq({ url: '/api/seerr/request/11/retry', method: 'POST', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 200);
+  assert.equal(retryWith, 11);
+  // markRetrySucceeded bumps retry_attempts and flips status to 'queued'.
+  const row = store.listAudit().find(r => r.id === auditId)!;
+  assert.equal(row.status, 'queued');
+  assert.equal(row.retryAttempts, 1);
+});
+
+test('router: POST /api/seerr/request/:id/approve returns 502 on seerr failure', async () => {
+  const store = new Store(':memory:');
+  const seerr = { ...fakeSeerr(), approveRequest: async () => { throw new Error('seerr 500'); } };
+  const deps = mkDeps(store, { seerr });
+  const req = mkReq({ url: '/api/seerr/request/3/approve', method: 'POST', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 502);
+  const j = JSON.parse(res.body);
+  assert.equal(j.id, 3);
+  assert.match(j.error, /seerr 500/);
+});
+
+// ----------------- write endpoints: /api/pending/:id/* -----------------
+
+test('router: POST /api/pending/:id/retry sends + deletes on success', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueuePending('jid@s.whatsapp.net', 'hello');
+  let sentTo: string | null = null;
+  const deps = mkDeps(store, {
+    send: async (to: string) => { sentTo = to; return null; },
+  });
+  const req = mkReq({ url: `/api/pending/${id}/retry`, method: 'POST', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 200);
+  const j = JSON.parse(res.body);
+  assert.equal(j.id, id);
+  assert.equal(j.ok, true);
+  assert.equal(sentTo, 'jid@s.whatsapp.net');
+  assert.equal(store.countPending(), 0);
+});
+
+test('router: POST /api/pending/:id/retry returns 502 + marks failed on send error', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueuePending('jid@s.whatsapp.net', 'hello');
+  const deps = mkDeps(store, {
+    send: async () => { throw new Error('boom'); },
+  });
+  const req = mkReq({ url: `/api/pending/${id}/retry`, method: 'POST', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 502);
+  const j = JSON.parse(res.body);
+  assert.match(j.error, /boom/);
+  // Still present, but attempts bumped.
+  const row = store.listPending().find(r => r.id === id)!;
+  assert.equal(row.attempts, 1);
+});
+
+test('router: POST /api/pending/:id/delete removes row', async () => {
+  const store = new Store(':memory:');
+  const id = store.enqueuePending('jid@s.whatsapp.net', 'hello');
+  const deps = mkDeps(store);
+  const req = mkReq({ url: `/api/pending/${id}/delete`, method: 'POST', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 200);
+  const j = JSON.parse(res.body);
+  assert.equal(j.id, id);
+  assert.equal(j.deleted, true);
+  assert.equal(store.countPending(), 0);
+});
+
+// ----------------- write endpoints: /api/commands -----------------
+
+test('router: POST /api/commands rejects unknown name with 400', async () => {
+  const store = new Store(':memory:');
+  const deps = mkDeps(store);
+  const req = mkReq({
+    url: '/api/commands',
+    method: 'POST',
+    socket: { remoteAddress: '127.0.0.1' },
+    body: JSON.stringify({ name: 'eat_homework' }),
+  });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 400);
+  const j = JSON.parse(res.body);
+  assert.match(j.error, /unknown/);
+});
+
+test('router: POST /api/commands enqueues + returns 202 with id', async () => {
+  const store = new Store(':memory:');
+  const deps = mkDeps(store);
+  const req = mkReq({
+    url: '/api/commands',
+    method: 'POST',
+    socket: { remoteAddress: '127.0.0.1' },
+    body: JSON.stringify({ name: 'vacuum_db' }),
+  });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 202);
+  const j = JSON.parse(res.body);
+  assert.equal(typeof j.id, 'number');
+  assert.equal(j.name, 'vacuum_db');
+  assert.equal(j.status, 'queued');
+  const rows = store.listCommands();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.id, j.id);
+});
+
+test('router: POST /api/commands runs async (status flips after microtask)', async () => {
+  const store = new Store(':memory:');
+  const deps = mkDeps(store);
+  const req = mkReq({
+    url: '/api/commands',
+    method: 'POST',
+    socket: { remoteAddress: '127.0.0.1' },
+    body: JSON.stringify({ name: 'vacuum_db' }),
+  });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  // Yield enough microtasks for the queued runner to fire.
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+  const row = store.listCommands()[0]!;
+  assert.equal(row.status, 'succeeded');
+  assert.equal(row.result, 'db vacuumed');
+});
+
+test('router: POST /api/commands with malformed JSON → 400', async () => {
+  const store = new Store(':memory:');
+  const deps = mkDeps(store);
+  const req = mkReq({
+    url: '/api/commands',
+    method: 'POST',
+    socket: { remoteAddress: '127.0.0.1' },
+    body: '{not json',
+  });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 400);
+  const j = JSON.parse(res.body);
+  assert.match(j.error, /json/i);
+});
+
+test('router: POST /api/commands with body >8KB → 413', async () => {
+  const store = new Store(':memory:');
+  const deps = mkDeps(store);
+  const req = mkReq({
+    url: '/api/commands',
+    method: 'POST',
+    socket: { remoteAddress: '127.0.0.1' },
+    body: '{"name":"vacuum_db","pad":"' + 'x'.repeat(9000) + '"}',
+  });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 413);
+});
+
+// ----------------- GET /api/tasks -----------------
+
+test('router: GET /api/tasks returns rows shape', async () => {
+  const store = new Store(':memory:');
+  store.enqueueCommand('vacuum_db');
+  const deps = mkDeps(store);
+  const req = mkReq({ url: '/api/tasks', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 200);
+  const j = JSON.parse(res.body);
+  assert.ok(Array.isArray(j.rows));
+  assert.equal(j.rows.length, 1);
+  assert.equal(j.rows[0].name, 'vacuum_db');
+  assert.equal(j.rows[0].status, 'queued');
+});
+
+test('router: GET /api/tasks returns DESC ts', async () => {
+  const store = new Store(':memory:');
+  store.enqueueCommand('vacuum_db');
+  store.enqueueCommand('drain_pending');
+  store.enqueueCommand('reconnect_wa');
+  const deps = mkDeps(store);
+  const req = mkReq({ url: '/api/tasks', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  const j = JSON.parse(res.body);
+  assert.equal(j.rows.length, 3);
+  assert.equal(j.rows[0].name, 'reconnect_wa');
+  assert.equal(j.rows[2].name, 'vacuum_db');
 });

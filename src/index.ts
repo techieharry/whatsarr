@@ -75,6 +75,9 @@ async function start(): Promise<void> {
           seerr,
           syncthing,
           getConnectionStatus,
+          drainPending,
+          reconnectWa,
+          shutdown: requestShutdown,
         });
       }
       // periodic state cleanup
@@ -273,6 +276,19 @@ function extractText(m: WAMessage): string {
     ''
   );
 }
+
+// Triggered from POST /api/commands {name: 'reconnect_wa'}. Closes the current
+// Baileys socket (if any) and re-runs start() on the next tick. The existing
+// 'connection.update' close handler also schedules a reconnect, but this
+// closure handles the case where the socket is in some half-open state where
+// no 'close' fires.
+const reconnectWa = async (): Promise<void> => {
+  if (currentSock) {
+    try { currentSock.end(new Error('manual reconnect')); } catch {}
+    currentSock = null;
+  }
+  setTimeout(() => start().catch(e => log_.error({ err: e?.message }, 'reconnect failed')), 1000);
+};
 
 function requestShutdown(): void {
   log_.info('graceful shutdown requested');

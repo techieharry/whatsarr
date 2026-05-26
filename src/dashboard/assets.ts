@@ -17,6 +17,7 @@ export const INDEX_HTML = `<!doctype html>
     <a class="tab" data-tab="pending"   href="#pending">pending</a>
     <a class="tab" data-tab="syncthing" href="#syncthing">syncthing</a>
     <a class="tab" data-tab="feedback"  href="#feedback">feedback</a>
+    <a class="tab" data-tab="tasks"     data-write-only href="#tasks" hidden>tasks</a>
   </nav>
   <div class="status">
     <span id="conn-dot" class="dot dot-unknown" title="connection"></span>
@@ -84,11 +85,34 @@ export const INDEX_HTML = `<!doctype html>
   <section id="panel-pending" class="panel" hidden>
     <div class="scroll-x">
       <table id="pending-table" class="data">
-        <thead><tr><th>id</th><th>target</th><th>text</th><th>attempts</th><th>last error</th></tr></thead>
+        <thead><tr><th>id</th><th>target</th><th>text</th><th>attempts</th><th>last error</th><th class="th-actions" data-write-only hidden>actions</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
     <p id="pending-meta" class="meta">—</p>
+  </section>
+
+  <section id="panel-tasks" class="panel" data-write-only hidden>
+    <div class="card">
+      <h2>run command</h2>
+      <div id="tasks-commands" class="task-buttons"></div>
+      <form id="task-dm-form" class="task-form" hidden>
+        <label>to <input id="task-dm-to" type="text" placeholder="+15145551234 or jid" autocomplete="off" /></label>
+        <label>text <input id="task-dm-text" type="text" placeholder="message body" autocomplete="off" /></label>
+        <button type="submit">send</button>
+        <button type="button" id="task-dm-cancel">cancel</button>
+      </form>
+      <p id="task-shutdown-notice" class="meta" hidden>service shutting down — restart NSSM to bring it back</p>
+    </div>
+    <div class="card">
+      <h2>recent commands</h2>
+      <div class="scroll-x">
+        <table id="tasks-table" class="data">
+          <thead><tr><th>id</th><th>time</th><th>name</th><th>status</th><th>duration</th><th>result/error</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 
   <section id="panel-syncthing" class="panel" hidden>
@@ -114,11 +138,14 @@ export const INDEX_HTML = `<!doctype html>
   <aside class="drawer-body">
     <button id="drawer-close" class="drawer-close" type="button">close</button>
     <h2>row detail</h2>
+    <div id="drawer-error" class="drawer-error" hidden></div>
+    <div id="drawer-actions" class="drawer-actions" data-write-only hidden></div>
     <pre id="drawer-json" class="mono"></pre>
   </aside>
 </div>
 
 <div id="auth-banner" class="banner" hidden>token expired, re-bookmark <code>?token=…</code></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
 
 __WHATSARR_BOOTSTRAP__
 <script src="/dashboard/app.js"></script>
@@ -132,10 +159,20 @@ export const APP_JS = String.raw`(function () {
   var BOOT = window.__WHATSARR__ || { apiBase: '/api', features: {}, pollIntervals: { heartbeat: 1000, active: 5000, static: 30000 } };
   var API = BOOT.apiBase || '/api';
   var POLL = BOOT.pollIntervals || { heartbeat: 1000, active: 5000, static: 30000 };
+  var FEATURES = BOOT.features || {};
+  var WRITE = !!FEATURES.writeActions;
 
   var TABS = ['overview', 'requests', 'pending', 'syncthing', 'feedback'];
   var TIER = { overview: 'active', requests: 'active', pending: 'active', syncthing: 'static', feedback: 'static' };
+  if (WRITE) { TABS.push('tasks'); TIER.tasks = 'active'; }
   var authFailed = false;
+  var KNOWN_COMMANDS = [
+    { name: 'reconnect_wa',  label: 'Reconnect WA' },
+    { name: 'vacuum_db',     label: 'Vacuum DB' },
+    { name: 'drain_pending', label: 'Drain pending' },
+    { name: 'send_test_dm',  label: 'Send test DM' },
+    { name: 'shutdown',      label: 'Shutdown' }
+  ];
 
   var reqState = { limit: 50, offset: 0, status: '', user: '', group: '', since: false, total: 0 };
   var fbState = { kind: 'feedback' };
@@ -164,8 +201,43 @@ export const APP_JS = String.raw`(function () {
         return r.json();
       });
   }
+  function postJson(path, body) {
+    var init = { method: 'POST', credentials: 'include', headers: { accept: 'application/json' } };
+    if (body !== undefined && body !== null) {
+      init.headers['content-type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    return fetch(API + path, init).then(function (r) {
+      var ct = r.headers.get('content-type') || '';
+      var parse = ct.indexOf('application/json') >= 0 ? r.json() : r.text().then(function (t) { return t ? { error: t } : {}; });
+      return parse.then(function (data) {
+        if (r.status === 401) { authFailed = true; showAuthBanner(); throw new Error('unauthorized'); }
+        if (!r.ok) {
+          var msg = (data && data.error) ? String(data.error) : ('http ' + r.status);
+          var err = new Error(msg);
+          err.status = r.status;
+          err.body = data;
+          throw err;
+        }
+        authFailed = false; hideAuthBanner();
+        return data;
+      });
+    });
+  }
   function showAuthBanner() { var b = $('auth-banner'); if (b) b.hidden = false; }
   function hideAuthBanner() { var b = $('auth-banner'); if (b) b.hidden = true; }
+
+  function toast(msg, kind) {
+    var box = $('toasts');
+    if (!box) return;
+    var k = (kind === 'err' || kind === 'info') ? kind : 'ok';
+    var n = el('div', { cls: 'toast toast-' + k, text: String(msg) });
+    box.appendChild(n);
+    setTimeout(function () {
+      n.classList.add('toast-out');
+      setTimeout(function () { if (n.parentNode) n.parentNode.removeChild(n); }, 200);
+    }, 3000);
+  }
 
   function fmtUptime(s) {
     s = Math.max(0, Math.floor(Number(s) || 0));
@@ -200,6 +272,12 @@ export const APP_JS = String.raw`(function () {
     s = s == null ? '' : String(s);
     if (s.length <= n) return s;
     return s.slice(0, n) + '…';
+  }
+  function fmtDuration(startedAt, finishedAt) {
+    var s = Number(startedAt);
+    var f = Number(finishedAt);
+    if (!Number.isFinite(s) || !Number.isFinite(f) || f < s) return '';
+    return (f - s) + 'ms';
   }
 
   function activeTab() {
@@ -293,7 +371,57 @@ export const APP_JS = String.raw`(function () {
     var tr = ev.currentTarget;
     var row = JSON.parse(tr.dataset.row || '{}');
     $('drawer-json').textContent = JSON.stringify(row, null, 2);
+    renderDrawerActions(row);
+    var errBox = $('drawer-error');
+    if (errBox) { errBox.hidden = true; errBox.textContent = ''; }
     $('drawer').hidden = false;
+  }
+
+  function showDrawerError(msg) {
+    var errBox = $('drawer-error');
+    if (!errBox) return;
+    errBox.textContent = msg;
+    errBox.hidden = false;
+  }
+
+  function renderDrawerActions(row) {
+    var box = $('drawer-actions');
+    if (!box) return;
+    clear(box);
+    if (!WRITE) { box.hidden = true; return; }
+    var sid = row && row.seerrRequestId;
+    if (sid == null) { box.hidden = true; return; }
+    box.hidden = false;
+    var status = String(row.status || '');
+    var nonFinal = status !== 'succeeded';
+    var btnApprove = el('button', { cls: 'btn btn-ok', text: 'Approve', attrs: { type: 'button' } });
+    btnApprove.addEventListener('click', function () { actionSeerr(sid, 'approve'); });
+    box.appendChild(btnApprove);
+    if (nonFinal) {
+      var btnDeny = el('button', { cls: 'btn btn-bad', text: 'Deny', attrs: { type: 'button' } });
+      btnDeny.addEventListener('click', function () { actionSeerr(sid, 'deny'); });
+      box.appendChild(btnDeny);
+    }
+    var btnRetry = el('button', { cls: 'btn', text: 'Retry', attrs: { type: 'button' } });
+    btnRetry.addEventListener('click', function () { actionSeerr(sid, 'retry'); });
+    box.appendChild(btnRetry);
+  }
+
+  function actionSeerr(seerrRequestId, kind) {
+    var label = kind === 'approve' ? 'Approve' : kind === 'deny' ? 'Deny' : 'Retry';
+    if (!confirm(label + ' request ' + seerrRequestId + '?')) return;
+    postJson('/seerr/request/' + encodeURIComponent(seerrRequestId) + '/' + kind, null)
+      .then(function () {
+        var verb = kind === 'approve' ? 'approved' : kind === 'deny' ? 'denied' : 'retry queued';
+        toast(verb, 'ok');
+        $('drawer').hidden = true;
+        fetchRequests();
+      })
+      .catch(function (err) {
+        var msg = (err && err.message) ? err.message : 'error';
+        showDrawerError(msg);
+        toast(msg, 'err');
+      });
   }
 
   function renderPending(payload) {
@@ -303,15 +431,39 @@ export const APP_JS = String.raw`(function () {
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
       var errCell = el('td', { text: r.lastError ? trunc(r.lastError, 40) : '', title: r.lastError || '' });
-      tbody.appendChild(el('tr', null, [
+      var cells = [
         el('td', { text: r.id }),
         el('td', { text: maskTarget(r.targetJid) }),
         el('td', { text: trunc(r.text || '', 80) }),
         el('td', { text: r.attempts }),
         errCell
-      ]));
+      ];
+      if (WRITE) {
+        var actCell = el('td', { cls: 'cell-actions' });
+        var retryBtn = el('button', { cls: 'btn btn-sm', text: 'retry', attrs: { type: 'button' } });
+        var delBtn = el('button', { cls: 'btn btn-sm btn-bad', text: 'delete', attrs: { type: 'button' } });
+        (function (id) {
+          retryBtn.addEventListener('click', function () { actionPending(id, 'retry'); });
+          delBtn.addEventListener('click', function () { actionPending(id, 'delete'); });
+        })(r.id);
+        actCell.appendChild(retryBtn);
+        actCell.appendChild(delBtn);
+        cells.push(actCell);
+      }
+      tbody.appendChild(el('tr', null, cells));
     }
     $('pending-meta').textContent = (payload.total || rows.length) + ' pending';
+  }
+
+  function actionPending(id, kind) {
+    var label = kind === 'retry' ? 'Retry' : 'Delete';
+    if (!confirm(label + ' pending notification ' + id + '?')) return;
+    postJson('/pending/' + encodeURIComponent(id) + '/' + kind, null)
+      .then(function () {
+        toast(kind === 'retry' ? 'retry queued' : 'deleted', 'ok');
+        fetchJson('/pending').then(renderPending).catch(noop);
+      })
+      .catch(function (err) { toast((err && err.message) || 'error', 'err'); });
   }
 
   function renderSyncthing(s) {
@@ -377,6 +529,102 @@ export const APP_JS = String.raw`(function () {
     }
   }
 
+  function renderTasks(payload) {
+    var rows = (payload && payload.rows) || [];
+    rows.sort(function (a, b) { return Number(b.id) - Number(a.id); });
+    if (rows.length > 50) rows = rows.slice(0, 50);
+    var tbody = $('tasks-table').querySelector('tbody');
+    clear(tbody);
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var resultText = r.error ? r.error : (r.result || '');
+      var resultTd = el('td', { text: trunc(resultText, 120), title: resultText });
+      var statusTd = el('td', null, [el('span', { cls: 'badge b-' + (r.status || 'unknown'), text: r.status || '' })]);
+      tbody.appendChild(el('tr', null, [
+        el('td', { text: r.id }),
+        el('td', { text: fmtRelative(r.ts) }),
+        el('td', { text: r.name || '' }),
+        statusTd,
+        el('td', { text: fmtDuration(r.startedAt, r.finishedAt) }),
+        resultTd
+      ]));
+    }
+  }
+
+  function renderTaskCommands() {
+    var box = $('tasks-commands');
+    if (!box) return;
+    clear(box);
+    for (var i = 0; i < KNOWN_COMMANDS.length; i++) {
+      var spec = KNOWN_COMMANDS[i];
+      var btn = el('button', { cls: 'btn', text: spec.label, attrs: { type: 'button', 'data-cmd': spec.name } });
+      (function (s, b) {
+        b.addEventListener('click', function () { onCommandClick(s.name, s.label, b); });
+      })(spec, btn);
+      box.appendChild(btn);
+    }
+  }
+
+  function flashQueued(btn) {
+    if (!btn) return;
+    var orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'queued…';
+    setTimeout(function () {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }, 1000);
+  }
+
+  function onCommandClick(name, label, btn) {
+    if (name === 'send_test_dm') {
+      var form = $('task-dm-form');
+      if (form) form.hidden = false;
+      var to = $('task-dm-to'); if (to) to.focus();
+      return;
+    }
+    if (name === 'shutdown') {
+      if (!confirm('Shutdown the service?')) return;
+      if (!confirm('Really shutdown? NSSM must be restarted to bring it back.')) return;
+      flashQueued(btn);
+      postJson('/commands', { name: 'shutdown' })
+        .then(function () {
+          toast('shutdown queued', 'info');
+          var notice = $('task-shutdown-notice');
+          if (notice) notice.hidden = false;
+          fetchJson('/tasks').then(renderTasks).catch(noop);
+        })
+        .catch(function (err) {
+          toast((err && err.message) || 'error', 'err');
+        });
+      return;
+    }
+    if (!confirm('Run ' + label + '?')) return;
+    flashQueued(btn);
+    postJson('/commands', { name: name })
+      .then(function () {
+        toast(label + ' queued', 'ok');
+        fetchJson('/tasks').then(renderTasks).catch(noop);
+      })
+      .catch(function (err) { toast((err && err.message) || 'error', 'err'); });
+  }
+
+  function submitTestDm(ev) {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    var to = ($('task-dm-to').value || '').trim();
+    var text = ($('task-dm-text').value || '').trim();
+    if (!to || !text) { toast('to and text required', 'err'); return; }
+    postJson('/commands', { name: 'send_test_dm', args: { to: to, text: text } })
+      .then(function () {
+        toast('test DM queued', 'ok');
+        $('task-dm-form').hidden = true;
+        $('task-dm-to').value = '';
+        $('task-dm-text').value = '';
+        fetchJson('/tasks').then(renderTasks).catch(noop);
+      })
+      .catch(function (err) { toast((err && err.message) || 'error', 'err'); });
+  }
+
   function pollHeartbeat() {
     fetchJson('/heartbeat').then(renderHeartbeat).catch(function () {
       var dot = $('conn-dot');
@@ -390,6 +638,7 @@ export const APP_JS = String.raw`(function () {
     if (tab === 'overview') fetchJson('/overview').then(renderOverview).catch(noop);
     if (tab === 'requests') fetchRequests();
     if (tab === 'pending') fetchJson('/pending').then(renderPending).catch(noop);
+    if (tab === 'tasks' && WRITE) fetchJson('/tasks').then(renderTasks).catch(noop);
   }
   function refreshStatic() {
     var tab = activeTab();
@@ -436,8 +685,28 @@ export const APP_JS = String.raw`(function () {
     document.querySelector('.drawer-backdrop').addEventListener('click', function () { $('drawer').hidden = true; });
   }
 
+  function applyWriteFeatureFlag() {
+    var nodes = document.querySelectorAll('[data-write-only]');
+    for (var i = 0; i < nodes.length; i++) {
+      nodes[i].hidden = !WRITE;
+    }
+  }
+
+  function wireTasks() {
+    if (!WRITE) return;
+    renderTaskCommands();
+    var form = $('task-dm-form');
+    if (form) form.addEventListener('submit', submitTestDm);
+    var cancel = $('task-dm-cancel');
+    if (cancel) cancel.addEventListener('click', function () {
+      var f = $('task-dm-form'); if (f) f.hidden = true;
+    });
+  }
+
   function start() {
+    applyWriteFeatureFlag();
     wireFilters();
+    wireTasks();
     window.addEventListener('hashchange', function () { showTab(activeTab()); });
     showTab(activeTab());
     pollHeartbeat();
@@ -558,4 +827,34 @@ table.data.clickable tbody tr:hover { background: var(--panel-2); }
 
 .banner { position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%); background: var(--bad); color: #fff; padding: .5rem 1rem; border-radius: 4px; font-family: var(--mono); font-size: 13px; z-index: 20; }
 .banner code { background: rgba(0,0,0,.25); padding: 0 .25rem; border-radius: 2px; }
+
+.btn { background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: .35rem .7rem; cursor: pointer; font: inherit; }
+.btn:hover { background: var(--panel); }
+.btn:disabled { opacity: .6; cursor: not-allowed; }
+.btn-sm { padding: .15rem .4rem; font-size: 12px; }
+.btn-ok { color: var(--ok); border-color: var(--ok); }
+.btn-bad { color: var(--bad); border-color: var(--bad); }
+
+.cell-actions { white-space: nowrap; }
+.cell-actions .btn + .btn { margin-left: .35rem; }
+
+.drawer-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .75rem 0; }
+.drawer-actions[hidden] { display: none; }
+.drawer-error { background: rgba(248, 81, 73, .12); color: var(--bad); border: 1px solid var(--bad); border-radius: 4px; padding: .5rem .75rem; margin: .5rem 0; font-family: var(--mono); font-size: 12px; }
+.drawer-error[hidden] { display: none; }
+
+.task-buttons { display: flex; flex-wrap: wrap; gap: .5rem; }
+.task-form { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; align-items: flex-end; }
+.task-form[hidden] { display: none; }
+.task-form label { display: flex; flex-direction: column; gap: .2rem; font-size: 12px; color: var(--fg-dim); }
+.task-form input { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: .3rem .5rem; font: inherit; min-width: 14rem; }
+
+.b-running { color: var(--accent); border-color: var(--accent); }
+
+.toasts { position: fixed; bottom: 1rem; right: 1rem; display: flex; flex-direction: column-reverse; gap: .35rem; z-index: 30; pointer-events: none; max-width: min(360px, 90vw); }
+.toast { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-left-width: 3px; border-radius: 4px; padding: .5rem .75rem; font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,.35); pointer-events: auto; opacity: 1; transition: opacity .2s ease; }
+.toast-out { opacity: 0; }
+.toast-ok { border-left-color: var(--ok); }
+.toast-err { border-left-color: var(--bad); }
+.toast-info { border-left-color: var(--accent); }
 `;
