@@ -132,13 +132,20 @@ export async function getMediaInfo(mediaType: 'movie' | 'tv', tmdbId: number): P
     const j = await call(`/api/v1/${mediaType}/${tmdbId}`);
     if (!j?.mediaInfo) return null;
     const mi = j.mediaInfo;
-    const ext = mi.externalServiceId ?? mi.externalServiceIdYear ?? null;
-    return {
-      status: mi.status,
-      downloadStatus: mi.downloadStatus ?? [],
-      externalServiceId: typeof ext === 'number' ? ext : null,
-      serverId: typeof mi.serverId === 'number' ? mi.serverId : null,
-    };
+    // A request can be HD, 4k, or both. Overseerr splits every field into an HD
+    // tier (status/externalServiceId/serverId/downloadStatus) and a 4k tier
+    // (…4k). Pick ONE coherent tier — falling back to 4k only for a 4k-ONLY
+    // request — so status, the *arr id, the server, and download progress all
+    // describe the same thing. (Mixing tiers made a 4k-only item read as HD
+    // UNKNOWN while pointing at the 4k id — wrong skip + wasted priority.)
+    const use4k = typeof mi.externalServiceId !== 'number' && typeof mi.externalServiceId4k === 'number';
+    const ext = use4k ? mi.externalServiceId4k : (typeof mi.externalServiceId === 'number' ? mi.externalServiceId : null);
+    const srv = use4k
+      ? (typeof mi.server4kId === 'number' ? mi.server4kId : null)
+      : (typeof mi.serverId === 'number' ? mi.serverId : null);
+    const status = use4k ? (mi.status4k ?? mi.status) : mi.status;
+    const downloadStatus = (use4k ? mi.downloadStatus4k : mi.downloadStatus) ?? [];
+    return { status, downloadStatus, externalServiceId: ext, serverId: srv };
   } catch (e: any) {
     log_.warn({ tmdbId, err: e?.message }, 'getMediaInfo failed');
     return null;

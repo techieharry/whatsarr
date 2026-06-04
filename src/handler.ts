@@ -902,9 +902,11 @@ async function handleQueue(deps: Deps, msg: IncomingMessage): Promise<Reply[]> {
   return [reply(replyTo, lines.join('\n'), mentions)];
 }
 
-// !prioritize — bump a request to the front by forcing an immediate Sonarr/
-// Radarr search (skip the RSS-sync wait). Member-facing with a tight per-day
-// cap (cutting the line + forcing an indexer search shouldn't be unlimited).
+// !prioritize — bump request(s) to the front by forcing an immediate Sonarr/
+// Radarr search (skip the RSS-sync wait). Member-facing with a tight per-day cap
+// (one command = one priority, even when it fans out). A title can exist as BOTH
+// a movie and a TV entry (e.g. an OVA + its compilation film); when the member
+// has requested more than one form, all matching forms are pushed together.
 // Targets the named title, or the sender's most recent real request.
 async function handlePrioritize(
   deps: Deps,
@@ -918,23 +920,41 @@ async function handlePrioritize(
   if (config.limits.priorityPerDay <= 0 || !deps.arr) {
     return r(`@${msg.senderNumber} prioritize isn't enabled here.`);
   }
-
-  // Per-member daily cap, checked before any work.
   const cap = config.limits.priorityPerDay;
   if (deps.store.getPriorityCount(msg.senderNumber) >= cap) {
     return r(`@${msg.senderNumber} you've used your ${cap} priorit${cap === 1 ? 'y' : 'ies'} for today — resets tomorrow.`);
   }
 
-  // Resolve the target: an explicit title, else the most recent real request.
-  let mediaType: 'movie' | 'tv';
-  let tmdbId: number;
+  // ---- Resolve candidate(s) ----
+  type Candidate = { mediaType: 'movie' | 'tv'; tmdbId: number };
+  let candidates: Candidate[];
   let display: string;
   if (parsed.title) {
-    const top = (await deps.seerr.search(parsed.title))[0];
-    if (!top) return r(`@${msg.senderNumber} couldn't find "${parsed.title}".`);
-    mediaType = top.mediaType === 'tv' ? 'tv' : 'movie';
-    tmdbId = top.id;
-    display = top.title ?? top.name ?? parsed.title;
+    const results = (await deps.seerr.search(parsed.title))
+      .filter(x => x.mediaType === 'movie' || x.mediaType === 'tv');
+    if (!results.length) return r(`@${msg.senderNumber} couldn't find "${parsed.title}".`);
+    // "Requested" = Seerr knows about it in EITHER quality tier (status >= 2).
+    const isReq = (x: seerrModule.SearchResult) =>
+      (x.mediaInfo?.status ?? 0) >= 2 || (x.mediaInfo?.status4k ?? 0) >= 2;
+    const requested = results.filter(isReq);
+    if (!requested.length) {
+      const t = results[0]!;
+      return r(`@${msg.senderNumber} *${t.title ?? t.name ?? parsed.title}* doesn't look requested yet — \`!movie\`/\`!tv\` it first.`);
+    }
+    // Anchor on the most-prioritizable requested hit (downloading > pending/
+    // partial > available, considering BOTH quality tiers), then take every
+    // requested entry that shares its (normalized) title — so a movie + its show
+    // both get pushed, but a loosely-related "Inside <X>" that merely matched the
+    // search does not.
+    const score = (s?: number) => (s === 3 ? 4 : s === 2 || s === 4 ? 3 : s === 5 ? 2 : 0);
+    const rank = (x: seerrModule.SearchResult) => Math.max(score(x.mediaInfo?.status), score(x.mediaInfo?.status4k));
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const anchor = requested.slice().sort((a, b) => rank(b) - rank(a))[0]!;
+    const key = norm(anchor.title ?? anchor.name ?? '');
+    candidates = requested
+      .filter(x => norm(x.title ?? x.name ?? '') === key)
+      .map(x => ({ mediaType: x.mediaType === 'tv' ? 'tv' as const : 'movie' as const, tmdbId: x.id }));
+    display = anchor.title ?? anchor.name ?? parsed.title;
   } else {
     const recent = deps.store
       .getUserRequests(msg.senderNumber, 10)
@@ -942,43 +962,68 @@ async function handlePrioritize(
     if (!recent) {
       return r(`@${msg.senderNumber} you have no recent request to prioritize. Try \`!prioritize <title>\`.`);
     }
-    mediaType = recent.seerrMediaType as 'movie' | 'tv';
-    tmdbId = recent.seerrMediaId!;
-    display = recent.command.replace(/^(movie|tv|prioritize)\s+/i, '');
+    candidates = [{ mediaType: recent.seerrMediaType as 'movie' | 'tv', tmdbId: recent.seerrMediaId! }];
+    display = cleanDisplay(recent.command);
   }
 
-  // Where is it? We need the *arr item id (externalServiceId) + current status.
-  const info = await deps.seerr.getMediaInfo(mediaType, tmdbId);
-  if (!info) {
+  // ---- Per-candidate: look up live status, force-search the prioritizable ones ----
+  const searched: Candidate[] = [];
+  const buckets = { available: 0, unavailable: 0, pending: 0, missing: 0 };
+  let anyError = false;
+  for (const c of candidates) {
+    const info = await deps.seerr.getMediaInfo(c.mediaType, c.tmdbId);
+    if (!info) { buckets.missing++; continue; }
+    if (info.status === 5) { buckets.available++; continue; }
+    if (info.status === 6 || info.status === 7) { buckets.unavailable++; continue; }   // blacklisted / deleted
+    if (info.externalServiceId === null) { buckets.pending++; continue; }
+    try {
+      await deps.arr.forceSearch(c.mediaType, info.externalServiceId, info.serverId);
+      searched.push(c);
+    } catch (e: any) {
+      anyError = true;
+      log_.warn({ err: e?.message, tmdbId: c.tmdbId }, 'prioritize force-search failed');
+    }
+  }
+
+  // ---- Report ----
+  if (!searched.length) {
+    if (anyError) return r(`@${msg.senderNumber} couldn't reach the downloader to prioritize *${display}* — try again in a minute.`);
+    if (buckets.available) return r(`@${msg.senderNumber} *${display}* is already on Plex — nothing to prioritize. ✓`);
+    if (buckets.unavailable) return r(`@${msg.senderNumber} *${display}* was removed/blacklisted — can't prioritize it.`);
+    if (buckets.pending) return r(`@${msg.senderNumber} *${display}* isn't with the downloader yet (still pending approval). Try again once it's approved.`);
     return r(`@${msg.senderNumber} *${display}* doesn't look requested yet — \`!movie\`/\`!tv\` it first.`);
   }
-  if (info.status === 5) {
-    return r(`@${msg.senderNumber} *${display}* is already on Plex — nothing to prioritize. ✓`);
-  }
-  if (info.externalServiceId === null) {
-    return r(`@${msg.senderNumber} *${display}* isn't with the downloader yet (still pending approval). Try again once it's approved.`);
-  }
 
-  try {
-    await deps.arr.forceSearch(mediaType, info.externalServiceId, info.serverId);
-  } catch (e: any) {
-    log_.warn({ err: e?.message, tmdbId }, 'prioritize force-search failed');
-    return r(`@${msg.senderNumber} couldn't reach the downloader to prioritize *${display}* — try again in a minute.`);
-  }
-
+  // One command = one priority, even when it fanned out to several entries.
   const left = cap - deps.store.bumpPriority(msg.senderNumber);
-  deps.store.audit({
-    senderJid: msg.senderJid,
-    senderNumber: msg.senderNumber,
-    groupJid: msg.isGroup ? msg.fromJid : null,
-    command: `prioritize ${display}`,
-    seerrMediaType: mediaType,
-    seerrMediaId: tmdbId,
-    seerrRequestId: null,
-    status: 'queued',
-  });
+  for (const c of searched) {
+    deps.store.audit({
+      senderJid: msg.senderJid,
+      senderNumber: msg.senderNumber,
+      groupJid: msg.isGroup ? msg.fromJid : null,
+      command: `prioritize ${display}`,
+      seerrMediaType: c.mediaType,
+      seerrMediaId: c.tmdbId,
+      seerrRequestId: null,
+      status: 'queued',
+    });
+  }
+  const label = (mt: 'movie' | 'tv') => (mt === 'tv' ? 'show' : 'movie');
+  const kinds = [...new Set(searched.map(c => label(c.mediaType)))];
+  const suffix = kinds.length > 1 ? ` (${kinds.join(' + ')})` : '';
   const tail = left > 0 ? ` (${left} priorit${left === 1 ? 'y' : 'ies'} left today)` : ` (last one for today)`;
-  return r(`🚀 @${msg.senderNumber} pushed *${display}* to the front — searching for a release now.${tail}`);
+  return r(`🚀 @${msg.senderNumber} pushed *${display}*${suffix} to the front — searching for a release now.${tail}`);
+}
+
+// Clean display title from a stored audit command: strip the leading verb, a
+// watchlist:<label> prefix, and fall back to a generic label when only a bare
+// TMDb id remains (numbered-picker rows store e.g. "movie 27205").
+function cleanDisplay(command: string): string {
+  const d = command
+    .replace(/^(movie|tv|prioritize)\s+/i, '')
+    .replace(/^watchlist:\S+\s+/i, '')
+    .trim();
+  return d && !/^\d+$/.test(d) ? d : 'your last request';
 }
 
 async function handleRequest(

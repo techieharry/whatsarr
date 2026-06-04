@@ -392,7 +392,7 @@ export class Store {
       `SELECT command, seerr_media_type AS seerrMediaType, seerr_media_id AS seerrMediaId, status, ts
        FROM audit
        WHERE sender_number = ?
-       ORDER BY ts DESC
+       ORDER BY ts DESC, id DESC
        LIMIT ?`,
     ).all(senderNumber, limit) as any;
   }

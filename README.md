@@ -4,7 +4,7 @@ A WhatsApp request bot for Plex media. Household members and friends request mov
 
 ## Status
 
-**Production.** Runs as an always-on service against a live Plex/Seerr/Sonarr/Radarr stack: parser + routing, multi-result and season pickers, per-user attribution, multi-subscriber "now ready" notifications, watchlist auto-sync (Plex + Letterboxd), a failed-request retry loop, and an embedded operator dashboard. Deterministic, offline parser — no LLM in the request path. `tsc --noEmit` clean; the suite is 356 tests (`npm test`).
+**Production.** Runs as an always-on service against a live Plex/Seerr/Sonarr/Radarr stack: parser + routing, multi-result and season pickers, per-user attribution, multi-subscriber "now ready" notifications, watchlist auto-sync (Plex + Letterboxd), a failed-request retry loop, and an embedded operator dashboard. Deterministic, offline parser — no LLM in the request path. `tsc --noEmit` clean; the suite is 364 tests (`npm test`).
 
 ## How it works
 
@@ -141,7 +141,7 @@ npm install
 cp .env.example .env   # fill in Seerr URL/key, allowed group JIDs, admin number(s)
 npm run discover       # one-shot QR pairing + dump group JIDs
 npm start              # run the bot
-npm test               # 356 tests (node:test)
+npm test               # 364 tests (node:test)
 npm run demo -- "!movie dune part two"   # print parse + resolved route, no network
 ```
 

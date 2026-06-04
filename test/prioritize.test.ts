@@ -51,7 +51,10 @@ function mkDeps(store: any, opts: { arr?: any; search?: any[]; mediaInfo?: any }
 const AVAILABLE = { status: 5, downloadStatus: [], externalServiceId: 10, serverId: 0 };
 const PROCESSING = { status: 3, downloadStatus: [], externalServiceId: 55, serverId: 0 };
 const PENDING_NO_ARR = { status: 2, downloadStatus: [], externalServiceId: null, serverId: null };
-const MATRIX = [{ id: 603, mediaType: 'movie', title: 'The Matrix' }];
+// A requested title carries mediaInfo.status in the SEARCH result (that's how
+// the handler decides it's requestable before the detail lookup); UNREQ has none.
+const MATRIX = [{ id: 603, mediaType: 'movie', title: 'The Matrix', mediaInfo: { status: 3 } }];
+const UNREQ = [{ id: 603, mediaType: 'movie', title: 'The Matrix' }];
 
 // ---------- parser ----------
 
@@ -74,7 +77,7 @@ test('prioritize: disabled when no arr client is wired', async () => {
 test('prioritize <title>: not requested yet → tells them, no force-search, no quota', async () => {
   const store = new Store(':memory:');
   const arr = mockArr();
-  const replies = await handleMessage(mkDeps(store, { arr, search: MATRIX, mediaInfo: null }), grpMsg('!prioritize the matrix'));
+  const replies = await handleMessage(mkDeps(store, { arr, search: UNREQ }), grpMsg('!prioritize the matrix'));
   assert.match(replies[0]!.text, /doesn't look requested/);
   assert.equal(arr.calls.length, 0);
   assert.equal(store.getPriorityCount(MEMBER), 0);
@@ -113,7 +116,7 @@ test('prioritize <movie>: force-searches Radarr + consumes one priority', async 
 test('prioritize <tv>: force-searches Sonarr', async () => {
   const store = new Store(':memory:');
   const arr = mockArr();
-  const search = [{ id: 1396, mediaType: 'tv', name: 'Breaking Bad' }];
+  const search = [{ id: 1396, mediaType: 'tv', name: 'Breaking Bad', mediaInfo: { status: 4 } }];
   const mi = { status: 4, downloadStatus: [], externalServiceId: 7, serverId: 0 };
   const replies = await handleMessage(mkDeps(store, { arr, search, mediaInfo: mi }), grpMsg('!prioritize breaking bad'));
   assert.match(replies[0]!.text, /pushed \*Breaking Bad\*/);
@@ -160,5 +163,82 @@ test('prioritize: enforces the per-day cap (2), then refuses', async () => {
   const replies = await handleMessage(mkDeps(store, { arr: arr3, search: MATRIX, mediaInfo: PROCESSING }), grpMsg('!prioritize the matrix'));
   assert.match(replies[0]!.text, /used your 2 priorities/);
   assert.equal(arr3.calls.length, 0);   // capped → no force-search
+  store.close();
+});
+
+// Regression (live, 2026-06-04): a title can exist as BOTH a movie and a TV
+// entry on TMDb. "Cyber City Oedo 808" = tv 64210 (unrequested, ranked first by
+// Seerr) + movie 97187 (the REQUESTED, downloading one). Must prioritize the
+// movie, not blindly trust search()[0].
+test('prioritize <title>: dual movie+tv entry → picks the REQUESTED one, not search[0]', async () => {
+  const store = new Store(':memory:');
+  const arr = mockArr();
+  const seerr = {
+    search: async () => [
+      { id: 64210, mediaType: 'tv', name: 'Cyber City Oedo 808' },                      // ranked first, NOT requested
+      { id: 97187, mediaType: 'movie', title: 'Cyber City Oedo 808', mediaInfo: { status: 3 } }, // requested + downloading
+    ],
+    getMediaInfo: async (type: string, id: number) =>
+      type === 'movie' && id === 97187
+        ? { status: 3, downloadStatus: [], externalServiceId: 959, serverId: null }
+        : null,
+  } as any;
+  const replies = await handleMessage({ store, seerr, arr } as any, grpMsg('!prioritize Cyber City Oedo 808'));
+  assert.match(replies[0]!.text, /pushed \*Cyber City Oedo 808\* to the front/);
+  assert.deepEqual(arr.calls, [{ mediaType: 'movie', itemId: 959, serverId: null }]);   // the MOVIE's *arr id
+  store.close();
+});
+
+test('prioritize <title>: nothing requested across entries → falls back to top hit + "request it first"', async () => {
+  const store = new Store(':memory:');
+  const arr = mockArr();
+  const seerr = {
+    search: async () => [
+      { id: 1, mediaType: 'tv', name: 'Foo' },
+      { id: 2, mediaType: 'movie', title: 'Foo' },
+    ],
+    getMediaInfo: async () => null,
+  } as any;
+  const replies = await handleMessage({ store, seerr, arr } as any, grpMsg('!prioritize foo'));
+  assert.match(replies[0]!.text, /doesn't look requested/);
+  assert.equal(arr.calls.length, 0);
+  store.close();
+});
+
+// Live follow-up (2026-06-04): the member then requested the TV form TOO, so both
+// the movie (Radarr 959) AND the show (Sonarr 230) are downloading. One
+// !prioritize must fan out to BOTH *arr, consuming a single priority.
+test('prioritize <title>: BOTH movie + show requested → fans out to both *arr, one quota', async () => {
+  const store = new Store(':memory:');
+  const arr = mockArr();
+  const seerr = {
+    search: async () => [
+      { id: 64210, mediaType: 'tv', name: 'Cyber City Oedo 808', mediaInfo: { status: 3 } },
+      { id: 97187, mediaType: 'movie', title: 'Cyber City Oedo 808', mediaInfo: { status: 3 } },
+    ],
+    getMediaInfo: async (type: string, id: number) =>
+      type === 'tv' && id === 64210 ? { status: 3, downloadStatus: [], externalServiceId: 230, serverId: null } :
+      type === 'movie' && id === 97187 ? { status: 3, downloadStatus: [], externalServiceId: 959, serverId: null } : null,
+  } as any;
+  const replies = await handleMessage({ store, seerr, arr } as any, grpMsg('!prioritize Cyber City Oedo 808'));
+  assert.match(replies[0]!.text, /pushed \*Cyber City Oedo 808\* \(show \+ movie\)/);
+  assert.equal(arr.calls.length, 2);
+  assert.ok(arr.calls.some(c => c.mediaType === 'tv' && c.itemId === 230));
+  assert.ok(arr.calls.some(c => c.mediaType === 'movie' && c.itemId === 959));
+  assert.equal(store.getPriorityCount(MEMBER), 1);   // ONE priority for the whole command
+  store.close();
+});
+
+test('prioritize: blacklisted/deleted (status 6) → not force-searched, no quota', async () => {
+  const store = new Store(':memory:');
+  const arr = mockArr();
+  const seerr = {
+    search: async () => [{ id: 7, mediaType: 'movie', title: 'Nope', mediaInfo: { status: 6 } }],
+    getMediaInfo: async () => ({ status: 6, downloadStatus: [], externalServiceId: 5, serverId: 0 }),
+  } as any;
+  const replies = await handleMessage({ store, seerr, arr } as any, grpMsg('!prioritize nope'));
+  assert.match(replies[0]!.text, /removed\/blacklisted/);
+  assert.equal(arr.calls.length, 0);
+  assert.equal(store.getPriorityCount(MEMBER), 0);
   store.close();
 });

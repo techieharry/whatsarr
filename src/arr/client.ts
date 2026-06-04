@@ -49,22 +49,29 @@ async function servers(type: ArrType): Promise<ArrServer[]> {
   const hit = cache[type];
   if (hit && Date.now() - hit.at < SERVER_CACHE_TTL_MS) return hit.servers;
   const list = await getArrServers(type);
-  cache[type] = { at: Date.now(), servers: list };
+  // Only cache a non-empty result. A transient Seerr hiccup makes getArrServers
+  // return [] — caching that would pin the feature "off" for the full TTL even
+  // after Seerr recovers a second later. An empty list is retried next call.
+  if (list.length) cache[type] = { at: Date.now(), servers: list };
   return list;
 }
 
-// Resolve which *arr to call for a given Seerr serverId: env override wins; else
-// the server Seerr says (by id), falling back to the default / first configured.
+// Resolve which *arr to call for a given Seerr serverId. With more than one
+// server (e.g. an HD + a 4k Radarr), route by the request's serverId so the call
+// lands on the box that actually holds the item. The env override is the
+// single-box escape hatch, so it only wins when there's at most one discovered
+// server (or none — e.g. discovery is down but an override is set).
 async function resolve(type: ArrType, serverId: number | null): Promise<ResolvedServer | null> {
   const override = envOverride(type);
-  if (override) return override;
   const list = await servers(type);
-  if (!list.length) return null;
-  const s = (serverId !== null ? list.find(x => x.id === serverId) : undefined)
-    ?? list.find(x => x.isDefault)
-    ?? list[0];
-  if (!s || !s.apiKey) return null;
-  return { base: buildBase(s), apiKey: s.apiKey };
+  if (override && list.length <= 1) return override;
+  if (serverId !== null) {
+    const match = list.find(x => x.id === serverId);
+    if (match?.apiKey) return { base: buildBase(match), apiKey: match.apiKey };
+  }
+  if (override) return override;
+  const s = list.find(x => x.isDefault) ?? list[0];
+  return s?.apiKey ? { base: buildBase(s), apiKey: s.apiKey } : null;
 }
 
 // True when prioritize can work at all — an override is set, or Seerr has at
