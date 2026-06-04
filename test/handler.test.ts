@@ -13,8 +13,10 @@ process.env.LOG_LEVEL = 'silent';
 
 const { handleMessage } = await import('../src/handler.ts');
 const { Store } = await import('../src/state/store.ts');
+const { config } = await import('../src/config.ts');
 
 const ALLOWED_GROUP = '120363111111111111@g.us';
+const SECOND_GROUP = '120363111111111112@g.us';
 const OTHER_GROUP = '120363999999999999@g.us';
 const ADMIN_JID = '15555550100@s.whatsapp.net';
 const RANDOM_JID = '15551234567@s.whatsapp.net';
@@ -556,5 +558,78 @@ test('!status returns Seerr version', async () => {
   );
   assert.equal(replies.length, 1);
   assert.match(replies[0]!.text, /Seerr v3\.2\.0/);
+  store.close();
+});
+
+// ---------- !announce target picker (multiple allowed groups) ----------
+
+function adminDM(store: any, text: string) {
+  return handleMessage(
+    { store, seerr: fakeSeerr() } as any,
+    { fromJid: ADMIN_JID, senderJid: ADMIN_JID, senderNumber: '15555550100', text, isGroup: false } as any,
+  );
+}
+const groupPosts = (replies: any[]) => replies.filter(r => config.whatsapp.allowedGroups.includes(r.to));
+
+test('announce: admin !announce with >1 group → prompts for target, posts nothing yet', async () => {
+  const store = freshStore();
+  const replies = await adminDM(store, '!announce Maintenance tonight at 9pm');
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!.text, /Announce to which group/);
+  assert.equal(groupPosts(replies).length, 0);                 // nothing sent until they pick
+  assert.equal(store.getState(ADMIN_JID)?.awaiting, 'announce_target');
+  store.close();
+});
+
+test('announce: reply 1 → posts to the first group only + acks, clears state', async () => {
+  const store = freshStore();
+  await adminDM(store, '!announce hi');
+  const replies = await adminDM(store, '1');
+  const posts = groupPosts(replies);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0]!.to, config.whatsapp.allowedGroups[0]);
+  assert.equal(posts[0]!.text, 'hi');
+  assert.ok(!replies.some(r => r.to === SECOND_GROUP));         // the other group is untouched
+  assert.ok(replies.some(r => /Announcement sent/.test(r.text)));
+  assert.equal(store.getState(ADMIN_JID), null);
+  store.close();
+});
+
+test('announce: reply "both" → posts verbatim to every allowed group', async () => {
+  const store = freshStore();
+  await adminDM(store, '!announce all-hands');
+  const replies = await adminDM(store, 'both');
+  const targets = groupPosts(replies).map(r => r.to).sort();
+  assert.deepEqual(targets, [...config.whatsapp.allowedGroups].sort());
+  assert.ok(groupPosts(replies).every(r => r.text === 'all-hands'));
+  assert.equal(store.getState(ADMIN_JID), null);
+  store.close();
+});
+
+test('announce: the numbered N+1 option also means all groups', async () => {
+  const store = freshStore();
+  await adminDM(store, '!announce x');
+  const replies = await adminDM(store, String(config.whatsapp.allowedGroups.length + 1));
+  assert.equal(groupPosts(replies).length, config.whatsapp.allowedGroups.length);
+  store.close();
+});
+
+test('announce: reply NO → cancels, nothing posted, state cleared', async () => {
+  const store = freshStore();
+  await adminDM(store, '!announce oops');
+  const replies = await adminDM(store, 'NO');
+  assert.equal(groupPosts(replies).length, 0);
+  assert.match(replies[0]!.text, /cancelled/i);
+  assert.equal(store.getState(ADMIN_JID), null);
+  store.close();
+});
+
+test('announce: an out-of-range number re-prompts and keeps the pending state', async () => {
+  const store = freshStore();
+  await adminDM(store, '!announce still here');
+  const replies = await adminDM(store, '9');
+  assert.equal(groupPosts(replies).length, 0);
+  assert.match(replies[0]!.text, /Announce to which group/);
+  assert.equal(store.getState(ADMIN_JID)?.awaiting, 'announce_target');   // still pending
   store.close();
 });

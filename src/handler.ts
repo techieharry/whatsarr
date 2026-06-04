@@ -1,4 +1,4 @@
-import { config } from './config.ts';
+import { config, validateFeedUrl } from './config.ts';
 import { log } from './log.ts';
 import { parse, type ParsedCommand, type Category, type AdminAction } from './parser/commands.ts';
 import { resolveRoute, type MediaType, type Route } from './routing/table.ts';
@@ -7,6 +7,8 @@ import * as seerrModule from './seerr/client.ts';
 import * as syncthingModule from './syncthing/client.ts';
 import { isAllowedGroup, isAdmin } from './auth/groups.ts';
 import { runValidation, runDiagnosis, formatValidation, formatDiagnosis } from './diagnostics.ts';
+import type { PlexClient } from './watchlist/plex.ts';
+import { parseFilmLinks } from './links.ts';
 
 const log_ = log.child({ mod: 'handler' });
 
@@ -16,6 +18,7 @@ export type IncomingMessage = {
   senderNumber: string;   // digits only
   text: string;
   isGroup: boolean;
+  quotedText?: string;    // text of the quoted message when this is a quote-reply (for film-link queue)
 };
 
 export type Reply = {
@@ -34,6 +37,9 @@ export type Deps = {
   // Optional shutdown hook — wired by the index runtime so !shutdown can trigger
   // a graceful exit. Tests pass undefined; the admin handler reports the gap.
   shutdown?: () => void;
+  // Optional Plex client (Pass-free watchlist path) — wired when PLEX_TOKEN is
+  // set. Used by the !watchlist add plex-friend flow to validate friendship.
+  plex?: PlexClient;
 };
 
 type ConfirmPayload = {
@@ -108,6 +114,12 @@ type PickPayload = {
   route: Route;
   title: string;
   groupJid: string | null;
+  lastReEmitAt?: number;
+};
+
+type AnnouncePayload = {
+  body: string;
+  fromJid: string;   // where to ack + re-prompt (the channel the admin invoked from)
   lastReEmitAt?: number;
 };
 
@@ -275,6 +287,30 @@ export async function handleMessage(deps: Deps, msg: IncomingMessage): Promise<R
   const text = msg.text.trim();
   const startsWithPrefix = text.startsWith(config.whatsapp.commandPrefix);
 
+  // ---- Film-link quote-reply queue ----
+  // The bot reacts 🎬 to a shared Letterboxd film link (index.ts, a quiet signal,
+  // never a reply). To queue it, a member quote-replies that message with `q` /
+  // `!q`. We re-derive the film from the QUOTED text, so nothing was stored.
+  // Keyword is ONLY `q` (not `queue` — that's the real !queue command).
+  // Opt-out (!links off) silences only the ambient react; this explicit pull is
+  // always honored (pull, not push).
+  if (msg.quotedText) {
+    const kw = text.toLowerCase().replace(/^!/, '').trim();
+    if (kw === 'q') {
+      const links = parseFilmLinks(msg.quotedText);
+      if (links.length) {
+        // An explicit quote-reply queue cancels any in-flight prompt first, so it
+        // can't silently overwrite (or be polluted by) the member's prior state —
+        // mirrors the "!command cancels prior prompt" contract just below.
+        if (deps.store.getState(msg.senderJid)) {
+          deps.store.clearState(msg.senderJid);
+          log_.debug({ sender: msg.senderJid }, 'state cleared by link-queue');
+        }
+        return await handleRequest(deps, msg, { kind: 'request', mediaTypeHint: links[0]!.mediaType, category: null, title: links[0]!.title });
+      }
+    }
+  }
+
   // ---- State-driven response (YES/NO/MOVIE/TV/numbers) ----
   // If the user types a new !command, treat that as cancelling the prior
   // prompt and starting fresh — most natural intent.
@@ -342,6 +378,18 @@ export async function handleMessage(deps: Deps, msg: IncomingMessage): Promise<R
   }
   if (parsed.kind === 'admin') {
     return await handleAdmin(deps, msg, parsed);
+  }
+  if (parsed.kind === 'map') {
+    return handleMap(deps, msg, parsed);
+  }
+  if (parsed.kind === 'watchlist') {
+    return await handleWatchlist(deps, msg, parsed);
+  }
+  if (parsed.kind === 'announce') {
+    return handleAnnounce(deps, msg, parsed.body);
+  }
+  if (parsed.kind === 'links') {
+    return handleLinks(deps, msg, parsed);
   }
   if (parsed.kind === 'request') {
     return await handleRequest(deps, msg, parsed);
@@ -414,6 +462,274 @@ async function handleAdmin(
   }
 
   return [];
+}
+
+// Admin: manage the WhatsApp-number → Seerr-user-id mapping. Unmapped numbers
+// fall back to SEERR_DEFAULT_USER_ID, so this is purely additive — it just lets
+// the operator attribute a household member's requests to their own Seerr user.
+function handleMap(
+  deps: Deps,
+  msg: IncomingMessage,
+  parsed: Extract<ParsedCommand, { kind: 'map' }>,
+): Reply[] {
+  if (!isAdmin(msg.senderNumber)) {
+    log_.warn({ sender: msg.senderNumber, op: parsed.op }, 'map command from non-admin');
+    if (msg.isGroup) return [];
+    return [reply(msg.senderJid, `Admin only.`)];
+  }
+
+  const replyTo = msg.fromJid;
+  const mentions = msg.isGroup ? [msg.senderJid] : undefined;
+  const prefix = msg.isGroup ? `@${msg.senderNumber} ` : '';
+  const defaultUser = config.seerr.defaultUserId;
+
+  if (parsed.op === 'list') {
+    const rows = deps.store.listUserMap();
+    if (rows.length === 0) {
+      return [reply(replyTo, `${prefix}No user mappings — all requests use the default Seerr user (#${defaultUser}). Set one with \`!map <number> <seerr user id>\`.`, mentions)];
+    }
+    const lines = [`${prefix}*WhatsApp → Seerr user map (${rows.length}):*`];
+    for (const r of rows) lines.push(`• \`${r.senderNumber}\` → Seerr user #${r.seerrUserId}`);
+    return [reply(replyTo, lines.join('\n'), mentions)];
+  }
+
+  if (parsed.op === 'unset') {
+    deps.store.deleteSeerrUserId(parsed.number!);
+    return [reply(replyTo, `${prefix}Removed mapping for \`${parsed.number}\` — now uses default Seerr user (#${defaultUser}).`, mentions)];
+  }
+
+  // set
+  deps.store.setSeerrUserId(parsed.number!, parsed.seerrUserId!);
+  return [reply(replyTo, `${prefix}Mapped \`${parsed.number}\` → Seerr user #${parsed.seerrUserId}. Their future requests will be attributed to that account.`, mentions)];
+}
+
+// Watchlist auto-sync self-service. Any allow-listed member can register their
+// own Plex Watchlist / Letterboxd list feed; the poller (src/watchlist/sync.ts)
+// then auto-requests new items under that member's number. `add`/`remove`
+// operate on the sender's own feeds (admins can manage any); the guide/list are
+// open to all. Because non-admin DMs are silent-dropped, members run this in the
+// group — hence the Plex-URL privacy nudge on add.
+async function handleWatchlist(
+  deps: Deps,
+  msg: IncomingMessage,
+  parsed: Extract<ParsedCommand, { kind: 'watchlist' }>,
+): Promise<Reply[]> {
+  const replyTo = msg.fromJid;
+  const mentions = msg.isGroup ? [msg.senderJid] : undefined;
+  const prefix = msg.isGroup ? `@${msg.senderNumber} ` : '';
+  const owner = msg.senderNumber;
+  const admin = isAdmin(msg.senderNumber);
+
+  if (parsed.op === 'guide') {
+    return [reply(replyTo, watchlistGuide(prefix), mentions)];
+  }
+
+  if (parsed.op === 'add') {
+    if (!config.watchlist.selfService && !admin) {
+      return [reply(replyTo, `${prefix}Self-service watchlist sign-up is off — ask an admin to add your feed.`, mentions)];
+    }
+
+    // Pass-free Plex path: the 3rd token is the member's Plex USERNAME (no feed,
+    // no credential). Validate friendship against the owner token at add-time so
+    // a typo / un-friended account fails loudly with the fix instructions.
+    if (parsed.wlType === 'plex-friend') {
+      if (!deps.plex || !config.plex.token) {
+        return [reply(replyTo, `${prefix}Pass-free Plex sync isn't set up yet (no owner token). Ask the admin to set PLEX_TOKEN.`, mentions)];
+      }
+      const username = parsed.url!.trim();
+      let friends;
+      try {
+        friends = await deps.plex.listFriends();
+      } catch (e: any) {
+        return [reply(replyTo, `${prefix}Couldn't reach Plex to verify just now — try again in a bit.`, mentions)];
+      }
+      const friend = friends.find(f => f.username.toLowerCase() === username.toLowerCase());
+      if (!friend) {
+        return [reply(replyTo, `${prefix}I can't see a Plex friend named *${username}*. Two one-time steps in the Plex app: (1) accept the server owner's *friend request*, and (2) set your *Watchlist visibility to "Friends Only"* (not Private). Then run this again.`, mentions)];
+      }
+      const have = deps.store.countWatchlistSourcesByOwner(owner);
+      if (have >= config.watchlist.maxSourcesPerMember) {
+        return [reply(replyTo, `${prefix}You're at the feed limit (${config.watchlist.maxSourcesPerMember}). Remove one with \`!watchlist remove <id>\` first.`, mentions)];
+      }
+      const { id, inserted } = deps.store.addWatchlistSource({ type: 'plex-friend', url: `plexfriend://${friend.id}`, owner, label: `plex-friend:${username}` });
+      if (!inserted) {
+        return [reply(replyTo, `${prefix}Your Plex watchlist is already linked.`, mentions)];
+      }
+      return [reply(replyTo, `${prefix}Linked your Plex watchlist (#${id}, friend *${username}*) ✓ No Plex Pass needed. I'll import new titles within ~${config.watchlist.pollMinutes} min (up to ${config.limits.requestsPerDay}/day) and DM you when they're ready — just keep your Watchlist set to "Friends Only".`, mentions)];
+    }
+
+    let url: string;
+    try {
+      url = validateFeedUrl(parsed.wlType!, parsed.url!);
+    } catch (e: any) {
+      const hint = parsed.wlType === 'plex'
+        ? 'Expected an `https://rss.plex.tv/…` URL (app.plex.tv → Watchlist → Generate RSS Feed).'
+        : 'Expected an `https://letterboxd.com/<you>/list/<list>/rss/` URL.';
+      return [reply(replyTo, `${prefix}Can't add that feed: ${e?.message ?? 'invalid URL'}. ${hint}`, mentions)];
+    }
+    const count = deps.store.countWatchlistSourcesByOwner(owner);
+    if (count >= config.watchlist.maxSourcesPerMember) {
+      return [reply(replyTo, `${prefix}You're at the feed limit (${config.watchlist.maxSourcesPerMember}). Remove one with \`!watchlist remove <id>\` first.`, mentions)];
+    }
+    const label = `${parsed.wlType}:${owner}#${count + 1}`;
+    const { id, inserted } = deps.store.addWatchlistSource({ type: parsed.wlType!, url, owner, label });
+    if (!inserted) {
+      return [reply(replyTo, `${prefix}That feed is already on your list.`, mentions)];
+    }
+    const note = parsed.wlType === 'plex'
+      ? `\n_Tip: your Plex RSS link is private — delete your message above now that I've saved it._`
+      : '';
+    return [reply(
+      replyTo,
+      `${prefix}Added your ${parsed.wlType} feed (#${id}) ✓ I'll import new titles within ~${config.watchlist.pollMinutes} min — routed, deduped, and I'll DM you when they're on Plex (up to ${config.limits.requestsPerDay}/day).${note}`,
+      mentions,
+    )];
+  }
+
+  if (parsed.op === 'list') {
+    const rows = admin ? deps.store.listWatchlistSources() : deps.store.listWatchlistSourcesByOwner(owner);
+    if (rows.length === 0) {
+      return [reply(replyTo, `${prefix}No watchlist feeds yet. Add one with \`!watchlist add <plex|letterboxd> <url>\` — \`!watchlist\` for help.`, mentions)];
+    }
+    const lines = [`${prefix}*watchlist feeds${admin ? ' (all)' : ''}:*`];
+    for (const r of rows) {
+      lines.push(`• \`${r.id}\` ${r.type}${admin ? ` — ${r.owner}` : ''} — ${redactFeedUrl(r.url)}`);
+    }
+    lines.push('', `Remove one with \`!watchlist remove <id>\`.`);
+    return [reply(replyTo, lines.join('\n'), mentions)];
+  }
+
+  // remove
+  const src = deps.store.getWatchlistSource(parsed.id!);
+  if (!src) return [reply(replyTo, `${prefix}No feed #${parsed.id}.`, mentions)];
+  if (src.owner !== owner && !admin) {
+    return [reply(replyTo, `${prefix}Feed #${parsed.id} isn't yours.`, mentions)];
+  }
+  deps.store.deleteWatchlistSource(parsed.id!);
+  return [reply(replyTo, `${prefix}Removed feed #${parsed.id} (${src.type}). Already-imported titles stay queued.`, mentions)];
+}
+
+function watchlistGuide(prefix: string): string {
+  const lines = [
+    `${prefix}*Auto-request from your watchlist* 🎬`,
+    `Link a watchlist and I'll request new titles automatically — routed, de-duplicated, with a DM when they're on Plex (up to ${config.limits.requestsPerDay}/day).`,
+    '',
+  ];
+  // The no-Pass path only works when the owner has configured a Plex token.
+  if (config.plex.token) {
+    lines.push(
+      '*Plex Watchlist — no Plex Pass needed:*',
+      '1. In Plex: accept the owner\'s *friend request* + set your *Watchlist to "Friends Only"*',
+      '2. `!watchlist add plex-friend <your plex username>`',
+      '',
+      '*Plex Watchlist — with Plex Pass (RSS):*',
+    );
+  } else {
+    lines.push('*Plex Watchlist* (movies + shows — needs Plex Pass):');
+  }
+  lines.push(
+    '1. app.plex.tv → Watchlist → "..." → *Generate RSS Feed*',
+    '2. `!watchlist add plex <the https://rss.plex.tv/… url>`',
+    '_(that link is private — delete your message once I confirm)_',
+    '',
+    '*Letterboxd* (movies — use a public *list*, not the watchlist):',
+    '1. Make a public list, open it → RSS feed URL',
+    '2. `!watchlist add letterboxd https://letterboxd.com/<you>/list/<list>/rss/`',
+    '',
+    '`!watchlist list` — your feeds · `!watchlist remove <id>` — drop one',
+  );
+  return lines.join('\n');
+}
+
+// Friendly name for a group JID in admin-facing prompts (falls back to the JID
+// when no GROUP_LABELS entry is configured).
+function groupLabel(jid: string): string {
+  return config.whatsapp.groupLabels[jid] ?? jid;
+}
+
+// The "which group?" picker the admin gets before a multi-group announcement.
+// Lists each group, then a final "all/both" option; a short body preview reminds
+// them what they're about to send.
+function buildAnnounceTargetPrompt(groups: string[], body: string): string {
+  const preview = body.replace(/\s+/g, ' ').trim();
+  const shown = preview.length > 80 ? `${preview.slice(0, 79)}…` : preview;
+  const allWord = groups.length === 2 ? 'both' : 'all';
+  const lines = [`📣 Announce to which group?`, `> ${shown}`, ``];
+  groups.forEach((g, i) => lines.push(`${i + 1}. ${groupLabel(g)}`));
+  lines.push(`${groups.length + 1}. ${allWord}`);
+  lines.push(``, `Reply with a number — or NO to cancel.`);
+  return lines.join('\n');
+}
+
+// Post the body to the chosen groups + ack the admin (unless they invoked from
+// one of the targets, where the broadcast is already visible). Body keeps its
+// formatting — the bot posts as itself, one reply per group.
+function sendAnnouncement(msg: IncomingMessage, body: string, targets: string[]): Reply[] {
+  const replies: Reply[] = targets.map(g => reply(g, body));
+  if (!targets.includes(msg.fromJid)) {
+    const where = targets.length === 1
+      ? groupLabel(targets[0]!)
+      : `${targets.length} groups`;
+    replies.push(reply(msg.fromJid, `📣 Announcement sent to ${where}.`));
+  }
+  log_.info({ admin: msg.senderNumber, groups: targets.length }, 'announcement sent');
+  return replies;
+}
+
+// Admin: broadcast a message to allow-listed group(s). With a single allowed
+// group there's nothing to choose, so it sends immediately. With several, the
+// admin first picks a target (one group or all) via a numbered reply — the body
+// is stashed in conversation state and dispatched in handleStateResponse.
+// Silent-drop for non-admins in a group; explicit refusal in DM.
+function handleAnnounce(deps: Deps, msg: IncomingMessage, body: string): Reply[] {
+  if (!isAdmin(msg.senderNumber)) {
+    log_.warn({ sender: msg.senderNumber }, 'announce from non-admin');
+    if (msg.isGroup) return [];
+    return [reply(msg.senderJid, `Admin only.`)];
+  }
+  const groups = config.whatsapp.allowedGroups;
+  if (groups.length === 0) {
+    return [reply(msg.fromJid, `No allowed groups configured to announce to.`)];
+  }
+  if (groups.length === 1) {
+    return sendAnnouncement(msg, body, groups);
+  }
+  const ttl = Date.now() + config.limits.confirmTtlMinutes * 60_000;
+  const payload: AnnouncePayload = { body, fromJid: msg.fromJid };
+  deps.store.setState(msg.senderJid, { awaiting: 'announce_target', payload, expiresAt: ttl });
+  return [reply(msg.fromJid, buildAnnounceTargetPrompt(groups, body))];
+}
+
+// Per-member toggle for the ambient film-link 🎬 suggestion (index.ts reacts to
+// shared Letterboxd links; this silences it for the sender). Available to anyone.
+function handleLinks(
+  deps: Deps,
+  msg: IncomingMessage,
+  parsed: Extract<ParsedCommand, { kind: 'links' }>,
+): Reply[] {
+  const replyTo = msg.fromJid;
+  const mentions = msg.isGroup ? [msg.senderJid] : undefined;
+  const prefix = msg.isGroup ? `@${msg.senderNumber} ` : '';
+  if (parsed.op === 'status') {
+    const off = deps.store.isLinksOptedOut(msg.senderNumber);
+    return [reply(replyTo, off
+      ? `${prefix}Film-link suggestions are *off* for you. \`!links on\` to re-enable.`
+      : `${prefix}Film-link suggestions are *on*: share a Letterboxd film link and I'll add a 🎬 — quote-reply it with \`q\` to queue. \`!links off\` to silence.`, mentions)];
+  }
+  deps.store.setLinksOptOut(msg.senderNumber, parsed.op === 'off');
+  return [reply(replyTo, parsed.op === 'off'
+    ? `${prefix}Film-link suggestions silenced 🔕 — I won't react to your shared links.`
+    : `${prefix}Film-link suggestions back on 🎬 — quote-reply a film link with \`q\` to queue.`, mentions)];
+}
+
+// Don't echo a full Plex rss.plex.tv URL (a bearer secret) back into the chat.
+function redactFeedUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.hostname === 'rss.plex.tv' ? `${u.hostname}/…(private)` : url;
+  } catch {
+    return url;
+  }
 }
 
 // Human-readable bytes. Uses binary (1024) units to match Syncthing's own UI.
@@ -800,9 +1116,18 @@ async function queueBatch(
         mediaId: candidate.tmdbId,
         rootFolder: route.rootFolder,
         profileId: route.profileId,
+        userId: deps.store.getSeerrUserId(msg.senderNumber) ?? undefined,
         seasons: mediaType === 'tv' ? 'all' : undefined,
       });
       deps.store.updateAudit(auditId, { seerrRequestId: result?.id ?? null });
+      deps.store.addSubscription({
+        subscriberJid: msg.senderJid,
+        subscriberNumber: msg.senderNumber,
+        groupJid: msg.isGroup ? msg.fromJid : null,
+        mediaType,
+        tmdbId: candidate.tmdbId,
+        seasons: mediaType === 'tv' ? 'all' : null,
+      });
       deps.store.bumpQuota(msg.senderNumber);
       used += 1;
       deps.store.recordDedup(msg.senderNumber, mediaType, titleForDedup);
@@ -864,9 +1189,18 @@ async function handleStateResponse(
           mediaId: p.tmdbId,
           rootFolder: p.route.rootFolder,
           profileId: p.route.profileId,
+          userId: deps.store.getSeerrUserId(msg.senderNumber) ?? undefined,
           seasons: p.mediaType === 'tv' ? 'all' : undefined,
         });
         deps.store.updateAudit(auditId, { seerrRequestId: result?.id ?? null });
+        deps.store.addSubscription({
+          subscriberJid: msg.senderJid,
+          subscriberNumber: msg.senderNumber,
+          groupJid: p.groupJid,
+          mediaType: p.mediaType,
+          tmdbId: p.tmdbId,
+          seasons: p.mediaType === 'tv' ? 'all' : null,
+        });
         deps.store.bumpQuota(msg.senderNumber);
         deps.store.recordDedup(msg.senderNumber, p.mediaType, p.title);
         deps.store.clearState(msg.senderJid);
@@ -1022,9 +1356,18 @@ async function handleStateResponse(
           mediaId: p.tmdbId,
           rootFolder: p.route.rootFolder,
           profileId: p.route.profileId,
+          userId: deps.store.getSeerrUserId(msg.senderNumber) ?? undefined,
           seasons,
         });
         deps.store.updateAudit(auditId, { seerrRequestId: result?.id ?? null });
+        deps.store.addSubscription({
+          subscriberJid: msg.senderJid,
+          subscriberNumber: msg.senderNumber,
+          groupJid: p.groupJid,
+          mediaType: 'tv',
+          tmdbId: p.tmdbId,
+          seasons,            // 'all' | number[], already computed above
+        });
         deps.store.bumpQuota(msg.senderNumber);
         deps.store.recordDedup(msg.senderNumber, 'tv', p.title);
         deps.store.clearState(msg.senderJid);
@@ -1045,6 +1388,36 @@ async function handleStateResponse(
     });
     const r = buildSeasonPrompt(msg.senderNumber, p);
     return [{ ...r, to: replyTo, mentions }];
+  }
+
+  if (state.awaiting === 'announce_target') {
+    const p = state.payload as AnnouncePayload;
+    if (upper === 'NO' || upper === 'N') {
+      deps.store.clearState(msg.senderJid);
+      return [reply(p.fromJid, `Announcement cancelled.`)];
+    }
+    const groups = config.whatsapp.allowedGroups;
+    let targets: string[] | null = null;
+    if (upper === 'ALL' || upper === 'BOTH') {
+      targets = groups;
+    } else {
+      const n = Number(upper);
+      // 1..N pick a single group; N+1 is the "all/both" option.
+      if (Number.isInteger(n) && n >= 1 && n <= groups.length) targets = [groups[n - 1]!];
+      else if (n === groups.length + 1) targets = groups;
+    }
+    if (!targets) {
+      // Unparseable selection: re-emit the picker (throttled).
+      if (p.lastReEmitAt && Date.now() - p.lastReEmitAt < RE_EMIT_COOLDOWN_MS) return [];
+      deps.store.setState(msg.senderJid, {
+        awaiting: 'announce_target',
+        payload: { ...p, lastReEmitAt: Date.now() },
+        expiresAt: state.expiresAt,
+      });
+      return [reply(p.fromJid, buildAnnounceTargetPrompt(groups, p.body))];
+    }
+    deps.store.clearState(msg.senderJid);
+    return sendAnnouncement(msg, p.body, targets);
   }
 
   return null;
@@ -1068,12 +1441,15 @@ function helpText(forAdmin: boolean): string {
     '!queue                     your recent requests',
     '!status                    Seerr health',
     '!sync                      Plex ↔ remote-server sync status',
+    '!watchlist                 auto-request from your Plex/Letterboxd feed',
+    '!links on/off              toggle 🎬 queue-from-shared-links suggestions',
     '!feedback <message>        send feedback (auto-validates the bot)',
     '!issue <description>       report a bug (auto-runs diagnosis)',
     '!help                      this message',
     '```',
     '*Picker:* when multiple matches, reply `1` for one or `1,3` for several.',
     '*Seasons (TV):* reply `all`, `latest`, `1`, `1-3`, or `1,3,5`.',
+    '*Film links:* I add 🎬 to shared Letterboxd films — quote-reply with `q` to queue (`!links off` to mute).',
     '*Movie categories:* western (default), bollywood/bolly/hindi, pakistani/pak/urdu, foreign/intl, documentary/doc/docu, anime, animated/cartoon',
     '*TV categories:* western (default), documentary/doc/docu, bollywood/bolly/hindi, asian/kdrama/cdrama/jdrama, anime, animated/cartoon',
     '*Examples:*',
@@ -1094,6 +1470,10 @@ function helpText(forAdmin: boolean): string {
       '!pending                   list pending Seerr requests',
       '!approve <id>              approve a pending request',
       '!deny <id>                 decline a pending request',
+      '!map                       list WhatsApp → Seerr user mappings',
+      '!map <number> <userId>     attribute a number\'s requests to a Seerr user',
+      '!unmap <number>            revert a number to the default Seerr user',
+      '!announce <message>        broadcast (you pick which group, or all)',
       '!shutdown                  graceful exit (service auto-restarts)',
       '```',
     );

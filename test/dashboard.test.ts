@@ -15,7 +15,7 @@ process.env.SYNCTHING_FOLDERS = 'movies,tv';
 const { Store } = await import('../src/state/store.ts');
 const { authGate, maybeSetTokenCookie } = await import('../src/dashboard/auth.ts');
 const { dashboardRoute } = await import('../src/dashboard/routes.ts');
-const { router } = await import('../src/webhook.ts');
+const { router, rateLimitOk } = await import('../src/webhook.ts');
 const { isCommandName, runCommand, COMMAND_NAMES } = await import('../src/dashboard/commands.ts');
 
 type MockReq = {
@@ -550,6 +550,102 @@ test('router: /api/syncthing tolerates per-folder error', async () => {
   const movies = j.folders.find((f: any) => f.id === 'movies');
   assert.ok(movies.error);
   assert.equal(movies.completion, null);
+});
+
+// ----------------- webhook rate limiter -----------------
+
+test('rateLimitOk: allows up to the limit within a window, then blocks', () => {
+  const state = new Map();
+  const now = 1_000_000;
+  for (let i = 0; i < 3; i++) assert.equal(rateLimitOk(state, '1.2.3.4', now, 3, 60_000), true);
+  assert.equal(rateLimitOk(state, '1.2.3.4', now, 3, 60_000), false);  // 4th in window blocked
+});
+
+test('rateLimitOk: window rollover resets the counter', () => {
+  const state = new Map();
+  assert.equal(rateLimitOk(state, 'ip', 0, 1, 60_000), true);
+  assert.equal(rateLimitOk(state, 'ip', 1_000, 1, 60_000), false);    // same window
+  assert.equal(rateLimitOk(state, 'ip', 61_000, 1, 60_000), true);    // next window
+});
+
+test('rateLimitOk: separate IPs have independent budgets', () => {
+  const state = new Map();
+  assert.equal(rateLimitOk(state, 'a', 0, 1, 60_000), true);
+  assert.equal(rateLimitOk(state, 'a', 0, 1, 60_000), false);
+  assert.equal(rateLimitOk(state, 'b', 0, 1, 60_000), true);          // b unaffected by a
+});
+
+test('rateLimitOk: limit <= 0 disables (always allowed)', () => {
+  const state = new Map();
+  for (let i = 0; i < 100; i++) assert.equal(rateLimitOk(state, 'ip', 0, 0, 60_000), true);
+});
+
+// ----------------- /api/seerr/pending -----------------
+
+test('router: /api/seerr/pending returns rows, enriched with WA number when audit matches', async () => {
+  const store = new Store(':memory:');
+  store.audit({ senderJid: 'u@s.whatsapp.net', senderNumber: '15551234567', groupJid: null, command: 'movie dune', seerrMediaType: 'movie', seerrMediaId: 42, status: 'queued' });
+  const seerr = {
+    ...fakeSeerr(),
+    listPendingRequests: async () => [
+      { id: 7, status: 1, mediaType: 'movie', tmdbId: 42, title: 'Dune', requestedBy: 'admin', createdAt: '' },
+      { id: 8, status: 1, mediaType: 'tv', tmdbId: 99, title: 'Severance', requestedBy: 'admin', createdAt: '' },
+    ],
+  };
+  const deps = mkDeps(store, { seerr });
+  const req = mkReq({ url: '/api/seerr/pending', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  const j = JSON.parse(res.body);
+  assert.equal(j.rows.length, 2);
+  assert.equal(j.rows[0].waNumber, '15551234567');  // enriched from audit
+  assert.equal(j.rows[1].waNumber, null);            // no matching audit row
+});
+
+test('router: /api/seerr/pending returns 502 when seerr throws', async () => {
+  const store = new Store(':memory:');
+  const seerr = { ...fakeSeerr(), listPendingRequests: async () => { throw new Error('seerr down'); } };
+  const deps = mkDeps(store, { seerr });
+  const req = mkReq({ url: '/api/seerr/pending', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  assert.equal(res.statusCode, 502);
+});
+
+// ----------------- /api/conversations + store.listActiveConversations -----------------
+
+test('store: listActiveConversations returns unexpired rows with payload preview', () => {
+  const store = new Store(':memory:');
+  store.setState('u1@s.whatsapp.net', { awaiting: 'confirm', payload: { display: 'Dune: Part Two' }, expiresAt: Date.now() + 60000 });
+  store.setState('u2@s.whatsapp.net', { awaiting: 'pick', payload: { candidates: [{}, {}, {}] }, expiresAt: Date.now() + 60000 });
+  const rows = store.listActiveConversations();
+  assert.equal(rows.length, 2);
+  const byJid: any = {};
+  for (const r of rows) byJid[r.jid] = r;
+  assert.equal(byJid['u1@s.whatsapp.net'].payloadPreview, 'Dune: Part Two');
+  assert.equal(byJid['u2@s.whatsapp.net'].payloadPreview, '3 options');
+});
+
+test('store: listActiveConversations excludes expired rows', () => {
+  const store = new Store(':memory:');
+  store.setState('old@s.whatsapp.net', { awaiting: 'confirm', payload: { display: 'X' }, expiresAt: Date.now() - 1000 });
+  store.setState('live@s.whatsapp.net', { awaiting: 'confirm', payload: { display: 'Y' }, expiresAt: Date.now() + 60000 });
+  const rows = store.listActiveConversations();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.jid, 'live@s.whatsapp.net');
+});
+
+test('router: /api/conversations returns active rows', async () => {
+  const store = new Store(':memory:');
+  store.setState('u1@s.whatsapp.net', { awaiting: 'season', payload: { title: 'Breaking Bad' }, expiresAt: Date.now() + 60000 });
+  const deps = mkDeps(store);
+  const req = mkReq({ url: '/api/conversations', socket: { remoteAddress: '127.0.0.1' } });
+  const res = mkRes();
+  await router(req as any, res as any, deps as any);
+  const j = JSON.parse(res.body);
+  assert.equal(j.rows.length, 1);
+  assert.equal(j.rows[0].awaiting, 'season');
+  assert.equal(j.rows[0].payloadPreview, 'Breaking Bad');
 });
 
 test('router: /dashboard/ returns HTML with bootstrap injection', async () => {

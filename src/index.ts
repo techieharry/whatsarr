@@ -5,6 +5,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   jidNormalizedUser,
   isJidGroup,
+  normalizeMessageContent,
   type WAMessage,
   type WASocket,
 } from '@whiskeysockets/baileys';
@@ -16,11 +17,28 @@ import * as syncthing from './syncthing/client.ts';
 import { handleMessage, type IncomingMessage as InMsg } from './handler.ts';
 import { startWebhook } from './webhook.ts';
 import { sendWithRetry, isTransientSendError } from './sender.ts';
+import { syncWatchlists } from './watchlist/sync.ts';
+import { makePlexClient, type PlexClient } from './watchlist/plex.ts';
+import { isAllowedGroup } from './auth/groups.ts';
+import { hasFilmLink } from './links.ts';
 
 const log_ = log.child({ mod: 'index' });
 
+// Pass-free Plex watchlist reader — only built when an owner token is set. One
+// token reads the owner's own + friends' watchlists; shared by the poller and
+// the !watchlist add plex-friend validation.
+const plexClient: PlexClient | undefined = config.plex.token
+  ? makePlexClient({
+      token: config.plex.token,
+      clientId: config.plex.clientId,
+      discoverHost: config.plex.discoverHost,
+      communityHost: config.plex.communityHost,
+    })
+  : undefined;
+
 const MAX_PENDING_ATTEMPTS = 8;     // ~ minutes of retries before we give up
 const DRAIN_INTERVAL_MS = 60_000;   // safety net in case 'open' event was missed
+const SUBSCRIPTION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;  // reap notified subs after 30d
 
 // Failed-request retry policy. Seerr marks requests Failed when its axios
 // call to Sonarr times out (10s hardcoded in Seerr; Sonarr's own skyhook call
@@ -31,11 +49,19 @@ const RETRY_INTERVAL_MS = 60_000;
 const RETRY_MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = [60_000, 5 * 60_000, 30 * 60_000];  // before attempt N (0-indexed)
 
+// Delay the first watchlist poll after connect so startup isn't competing with
+// history sync / drain; the configured interval governs every poll after that.
+const WATCHLIST_INITIAL_DELAY_MS = 10_000;
+// Reap watchlist_item seen-rows older than this (re-seeing just re-requests,
+// absorbed by the availability check) to keep the table bounded.
+const WATCHLIST_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
+
 let stopWebhook: (() => void) | null = null;
 let store: Store | null = null;
 let currentSock: WASocket | null = null;
 let drainTimer: NodeJS.Timeout | null = null;
 let retryTimer: NodeJS.Timeout | null = null;
+let watchlistTimer: NodeJS.Timeout | null = null;
 const startTime = Date.now();
 const getConnectionStatus = () => ({
   connected: currentSock !== null,
@@ -81,7 +107,14 @@ async function start(): Promise<void> {
         });
       }
       // periodic state cleanup
-      setInterval(() => store!.cleanupExpiredState(), 60_000).unref();
+      setInterval(() => {
+        store!.cleanupExpiredState();
+        // Bound retention of subscriber identifiers: drop subscriptions notified
+        // more than 30 days ago (active rows are never reaped).
+        store!.reapNotifiedSubscriptions(Date.now() - SUBSCRIPTION_RETENTION_MS);
+        // Bound the watchlist seen-set the same way.
+        store!.reapWatchlistItems(Date.now() - WATCHLIST_RETENTION_MS);
+      }, 60_000).unref();
       // drain any notifications that piled up while we were disconnected
       drainPending().catch(e => log_.error({ err: e?.message }, 'drain on open failed'));
       if (!drainTimer) {
@@ -97,6 +130,22 @@ async function start(): Promise<void> {
           RETRY_INTERVAL_MS,
         );
         retryTimer.unref();
+      }
+      // Watchlist auto-sync. Runs on its own cadence — independent of WA traffic —
+      // but is started here so it shares the connected lifecycle. Started whenever
+      // polling is enabled (pollMinutes > 0), since members can add feeds at
+      // runtime via !watchlist even when no feeds exist at boot. An initial kick
+      // fires shortly after connect, then on the configured interval.
+      if (!watchlistTimer && config.watchlist.pollMinutes > 0) {
+        setTimeout(
+          () => runWatchlistSync().catch(e => log_.error({ err: e?.message }, 'initial watchlist sync failed')),
+          WATCHLIST_INITIAL_DELAY_MS,
+        ).unref();
+        watchlistTimer = setInterval(
+          () => runWatchlistSync().catch(e => log_.error({ err: e?.message }, 'periodic watchlist sync failed')),
+          config.watchlist.pollMinutes * 60_000,
+        );
+        watchlistTimer.unref();
       }
     }
     if (connection === 'close') {
@@ -172,11 +221,45 @@ async function processMessage(sock: WASocket, m: WAMessage): Promise<void> {
     senderNumber,
     text,
     isGroup: !!isGroup,
+    quotedText: extractQuotedText(m),
   };
 
-  const replies = await handleMessage({ store: store!, seerr, syncthing, shutdown: requestShutdown }, inMsg);
+  const replies = await handleMessage({ store: store!, seerr, syncthing, shutdown: requestShutdown, plex: plexClient }, inMsg);
   for (const r of replies) {
     await sendReply(sock, r);
+  }
+
+  // Ambient film-link signal: react 🎬 to a freshly-shared Letterboxd link so a
+  // member can quote-reply `q` to queue it — a quiet, ignorable nudge, never a
+  // chat reply. Best-effort; transient (nothing stored).
+  await maybeReactFilmLink(sock, m, inMsg);
+}
+
+// Text of the quoted message when this is a quote-reply (used for the film-link
+// queue confirm). Mirrors extractText for the quoted payload.
+function extractQuotedText(m: WAMessage): string | undefined {
+  // Unwrap both layers (the carrier and the quoted payload) so quote-replies work
+  // under disappearing/view-once messages too.
+  const outer = normalizeMessageContent(m.message);
+  const q = normalizeMessageContent(outer?.extendedTextMessage?.contextInfo?.quotedMessage);
+  if (!q) return undefined;
+  return q.conversation
+    ?? q.extendedTextMessage?.text
+    ?? q.imageMessage?.caption
+    ?? q.videoMessage?.caption
+    ?? undefined;
+}
+
+async function maybeReactFilmLink(sock: WASocket, m: WAMessage, inMsg: InMsg): Promise<void> {
+  try {
+    if (!inMsg.isGroup || !isAllowedGroup(inMsg.fromJid)) return;
+    if (inMsg.text.startsWith(config.whatsapp.commandPrefix)) return;  // a command, not a share
+    if (inMsg.quotedText) return;                                       // a quote-reply, not a fresh share
+    if (!hasFilmLink(inMsg.text)) return;
+    if (store!.isLinksOptedOut(inMsg.senderNumber)) return;
+    await sock.sendMessage(inMsg.fromJid, { react: { text: '🎬', key: m.key } });
+  } catch (e: any) {
+    log_.debug({ err: e?.message }, 'film-link react failed (non-fatal)');
   }
 }
 
@@ -265,8 +348,21 @@ async function retryFailedRequests(): Promise<void> {
   }
 }
 
+// Poll configured Plex Watchlist / Letterboxd list feeds and auto-request new
+// items through the shared request path. Does not need the WA socket (it talks
+// to Seerr); the eventual "now ready" DM rides the normal webhook fan-out.
+async function runWatchlistSync(): Promise<void> {
+  if (!store) return;
+  // syncWatchlists merges env + DB feeds + Pass-free Plex (friends) sources and
+  // returns early if none.
+  await syncWatchlists({ store, seerr, plex: plexClient });
+}
+
 function extractText(m: WAMessage): string {
-  const msg = m.message;
+  // normalizeMessageContent peels Baileys wrappers (ephemeral / view-once /
+  // documentWithCaption / edited) so text isn't missed in disappearing-message
+  // groups — without it, ALL command + link handling silently no-ops there.
+  const msg = normalizeMessageContent(m.message);
   if (!msg) return '';
   return (
     msg.conversation ??

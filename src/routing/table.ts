@@ -29,11 +29,10 @@ export const TV_ROUTES: Partial<Record<Category, Route>> = {
   animated:    { rootFolder: `${PLEX}\\TV Shows\\Requested Animated Shows\\Western`, profileId: 7, profileName: 'WEB-DL (1080p)' },
 };
 
-// Defense in depth: any rootFolder matching this regex MUST never be used,
-// even if a future config change accidentally adds it. Override this for
-// your setup with patterns matching personal/curated library folder names
-// the bot should never write to. Example below; edit to match your layout.
-export const FORBIDDEN_PATH = /(My Personal Collection|Curated|Archive)/;
+// Defense in depth: any rootFolder matching this MUST never be used,
+// even if a future config change accidentally adds it. See ROUTING.md
+// "Never routed to" section.
+export const FORBIDDEN_PATH = /(Haris's|Classic's|Award Winners)/;
 
 export type ResolveResult =
   | { ok: true; mediaType: MediaType; category: Category; route: Route }

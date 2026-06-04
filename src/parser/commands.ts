@@ -21,8 +21,18 @@ export type ParsedCommand =
   | { kind: 'feedback'; body: string }
   | { kind: 'issue'; body: string }
   | { kind: 'admin'; action: AdminAction; requestId: number | null }
+  | { kind: 'map'; op: 'set' | 'unset' | 'list'; number: string | null; seerrUserId: number | null }
+  | { kind: 'watchlist'; op: 'guide' | 'add' | 'list' | 'remove'; wlType: 'plex' | 'letterboxd' | 'plex-friend' | null; url: string | null; id: number | null }
+  | { kind: 'announce'; body: string }
+  | { kind: 'links'; op: 'on' | 'off' | 'status' }
   | { kind: 'incomplete'; cmd: string; reason: string }
   | { kind: 'unknown'; reason: string };
+
+// Strip a leading '+' and any spaces/dashes so '+1 555-555-0101' and
+// '15555550101' map to the same key the rest of the system uses (digits only).
+function normalizeNumberToken(token: string | undefined): string {
+  return (token ?? '').replace(/^\+/, '').replace(/[\s-]/g, '');
+}
 
 const CATEGORY_ALIASES: Record<string, Category> = {
   western: 'western',
@@ -81,6 +91,80 @@ export function parse(input: string, prefix = '!'): ParsedCommand {
       return { kind: 'incomplete', cmd, reason: `${cmd} needs a numeric request id` };
     }
     return { kind: 'admin', action, requestId: id };
+  }
+
+  // Toggle the ambient film-link 🎬 suggestion for the sender. `!links off`
+  // silences it; `!links on` re-enables; `!links` shows status.
+  if (cmd === 'links') {
+    const sub = (rest[0] ?? '').toLowerCase();
+    if (sub === 'off' || sub === 'mute' || sub === 'stop') return { kind: 'links', op: 'off' };
+    if (sub === 'on' || sub === 'unmute') return { kind: 'links', op: 'on' };
+    return { kind: 'links', op: 'status' };
+  }
+
+  // Broadcast a message to all allowed groups (admin). Caller MUST check
+  // isAdmin() before executing. The body keeps its original formatting/newlines
+  // (not whitespace-collapsed) so multi-line announcements come through intact.
+  if (cmd === 'announce' || cmd === 'broadcast') {
+    if (rest.length === 0) return { kind: 'incomplete', cmd: 'announce', reason: 'usage: !announce <message>' };
+    const body = trimmed.replace(/^\S+\s+/, '').trim();   // strip the !announce token, keep the rest verbatim
+    if (!body) return { kind: 'incomplete', cmd: 'announce', reason: 'usage: !announce <message>' };
+    return { kind: 'announce', body };
+  }
+
+  // Per-user Seerr account mapping (admin). `!map` / `!map list` lists; `!map
+  // <number> <seerrUserId>` sets; `!unmap <number>` removes. Caller MUST check
+  // isAdmin() before executing.
+  if (cmd === 'unmap') {
+    const number = normalizeNumberToken(rest[0]);
+    if (!number) return { kind: 'incomplete', cmd: 'unmap', reason: 'usage: !unmap <whatsapp number>' };
+    return { kind: 'map', op: 'unset', number, seerrUserId: null };
+  }
+  if (cmd === 'map') {
+    if (rest.length === 0 || rest[0]!.toLowerCase() === 'list') {
+      return { kind: 'map', op: 'list', number: null, seerrUserId: null };
+    }
+    const number = normalizeNumberToken(rest[0]);
+    const seerrUserId = Number.parseInt(rest[1] ?? '', 10);
+    if (!number || !Number.isFinite(seerrUserId) || seerrUserId < 1) {
+      return { kind: 'incomplete', cmd: 'map', reason: 'usage: !map <whatsapp number> <seerr user id>' };
+    }
+    return { kind: 'map', op: 'set', number, seerrUserId };
+  }
+
+  // Watchlist auto-sync self-service. `!watchlist` (or `!wl`) with no args shows
+  // the guide; `add <plex|letterboxd> <url>` registers a feed; `list` shows your
+  // feeds; `remove <id>` drops one. Owner is the sender (handler fills it in).
+  if (cmd === 'watchlist' || cmd === 'wl') {
+    const sub = (rest[0] ?? '').toLowerCase();
+    if (!sub || sub === 'help' || sub === 'guide') {
+      return { kind: 'watchlist', op: 'guide', wlType: null, url: null, id: null };
+    }
+    if (sub === 'list' || sub === 'ls') {
+      return { kind: 'watchlist', op: 'list', wlType: null, url: null, id: null };
+    }
+    if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+      const id = Number.parseInt(rest[1] ?? '', 10);
+      if (!Number.isFinite(id) || id < 1) {
+        return { kind: 'incomplete', cmd: 'watchlist', reason: 'usage: !watchlist remove <id>' };
+      }
+      return { kind: 'watchlist', op: 'remove', wlType: null, url: null, id };
+    }
+    if (sub === 'add') {
+      const typeRaw = (rest[1] ?? '').toLowerCase();
+      const wlType = typeRaw === 'plex' ? 'plex'
+        : (typeRaw === 'letterboxd' || typeRaw === 'lb') ? 'letterboxd'
+        : (typeRaw === 'plex-friend' || typeRaw === 'plexfriend' || typeRaw === 'pf') ? 'plex-friend'
+        : null;
+      // For plex/letterboxd the 3rd token is a feed URL; for plex-friend it's the
+      // member's Plex username (no feed, no credential).
+      const url = rest[2] ?? '';
+      if (!wlType || !url) {
+        return { kind: 'incomplete', cmd: 'watchlist', reason: 'usage: !watchlist add <plex|letterboxd> <feed url>  ·  or: !watchlist add plex-friend <your plex username>' };
+      }
+      return { kind: 'watchlist', op: 'add', wlType, url, id: null };
+    }
+    return { kind: 'incomplete', cmd: 'watchlist', reason: 'usage: !watchlist [add <plex|letterboxd> <url> | add plex-friend <plex username> | list | remove <id>]' };
   }
 
   let mediaTypeHint: MediaTypeHint;

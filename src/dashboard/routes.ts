@@ -135,6 +135,28 @@ export async function dashboardRoute(req: IM, res: ServerResponse, deps: Dashboa
     return;
   }
 
+  if (req.method === 'GET' && path === '/api/seerr/pending') {
+    try {
+      const rows = await deps.seerr.listPendingRequests(20);
+      // Enrich with the WhatsApp requester when we have an audit row for the
+      // same media, so the panel can show "Haris" / the number instead of just
+      // the Seerr display name.
+      const enriched = rows.map(r => {
+        const requester = deps.store.findRequester(r.mediaType, r.tmdbId);
+        return { ...r, waNumber: requester?.senderNumber ?? null };
+      });
+      sendJson(res, 200, { rows: enriched });
+    } catch (e: any) {
+      sendJson(res, 502, { error: e?.message ?? 'seerr pending failed' });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && path === '/api/conversations') {
+    sendJson(res, 200, { rows: deps.store.listActiveConversations() });
+    return;
+  }
+
   const seerrApprove = path.match(/^\/api\/seerr\/request\/(\d+)\/approve$/);
   if (req.method === 'POST' && seerrApprove) {
     const id = Number(seerrApprove[1]);

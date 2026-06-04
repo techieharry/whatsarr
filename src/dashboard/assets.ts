@@ -17,8 +17,10 @@ export const INDEX_HTML = `<!doctype html>
     <a class="tab" data-tab="overview"  href="#overview"  role="tab" aria-controls="panel-overview"  id="tab-overview"  aria-selected="true"  tabindex="0">overview</a>
     <a class="tab" data-tab="requests"  href="#requests"  role="tab" aria-controls="panel-requests"  id="tab-requests"  aria-selected="false" tabindex="-1">requests</a>
     <a class="tab" data-tab="pending"   href="#pending"   role="tab" aria-controls="panel-pending"   id="tab-pending"   aria-selected="false" tabindex="-1">pending</a>
+    <a class="tab" data-tab="seerr"     href="#seerr"     role="tab" aria-controls="panel-seerr"     id="tab-seerr"     aria-selected="false" tabindex="-1">seerr</a>
     <a class="tab" data-tab="syncthing" href="#syncthing" role="tab" aria-controls="panel-syncthing" id="tab-syncthing" aria-selected="false" tabindex="-1">syncthing</a>
     <a class="tab" data-tab="feedback"  href="#feedback"  role="tab" aria-controls="panel-feedback"  id="tab-feedback"  aria-selected="false" tabindex="-1">feedback</a>
+    <a class="tab" data-tab="conversations" href="#conversations" role="tab" aria-controls="panel-conversations" id="tab-conversations" aria-selected="false" tabindex="-1">conversations</a>
     <a class="tab" data-tab="tasks"     data-write-only href="#tasks" role="tab" aria-controls="panel-tasks" id="tab-tasks" aria-selected="false" tabindex="-1" hidden>tasks</a>
   </nav>
   <div class="status" role="status" aria-live="polite" aria-atomic="false">
@@ -95,6 +97,16 @@ export const INDEX_HTML = `<!doctype html>
     <p id="pending-meta" class="meta">—</p>
   </section>
 
+  <section id="panel-seerr" class="panel" role="tabpanel" aria-labelledby="tab-seerr" hidden>
+    <div class="scroll-x">
+      <table id="seerr-table" class="data">
+        <thead><tr><th>id</th><th>title</th><th>type</th><th>requested by</th><th>WA</th><th class="th-actions" data-write-only hidden>actions</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="seerr-meta" class="meta">—</p>
+  </section>
+
   <section id="panel-tasks" class="panel" role="tabpanel" aria-labelledby="tab-tasks" data-write-only hidden>
     <div class="card">
       <h2>run command</h2>
@@ -134,6 +146,16 @@ export const INDEX_HTML = `<!doctype html>
       </table>
     </div>
   </section>
+
+  <section id="panel-conversations" class="panel" role="tabpanel" aria-labelledby="tab-conversations" hidden>
+    <div class="scroll-x">
+      <table id="conversations-table" class="data">
+        <thead><tr><th>sender</th><th>awaiting</th><th>on</th><th>expires</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="conversations-meta" class="meta">—</p>
+  </section>
 </main>
 
 <div id="drawer" class="drawer" hidden>
@@ -165,8 +187,8 @@ export const APP_JS = String.raw`(function () {
   var FEATURES = BOOT.features || {};
   var WRITE = !!FEATURES.writeActions;
 
-  var TABS = ['overview', 'requests', 'pending', 'syncthing', 'feedback'];
-  var TIER = { overview: 'active', requests: 'active', pending: 'active', syncthing: 'static', feedback: 'static' };
+  var TABS = ['overview', 'requests', 'pending', 'seerr', 'syncthing', 'feedback', 'conversations'];
+  var TIER = { overview: 'active', requests: 'active', pending: 'active', seerr: 'active', syncthing: 'static', feedback: 'static', conversations: 'active' };
   if (WRITE) { TABS.push('tasks'); TIER.tasks = 'active'; }
   var authFailed = false;
   var KNOWN_COMMANDS = [
@@ -263,6 +285,13 @@ export const APP_JS = String.raw`(function () {
     if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
     if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
     return Math.floor(diff / 86400) + 'd ago';
+  }
+  function fmtExpiresIn(ts) {
+    var d = Math.floor((Number(ts) - Date.now()) / 1000);
+    if (!Number.isFinite(d) || d <= 0) return 'expired';
+    if (d < 60) return 'in ' + d + 's';
+    if (d < 3600) return 'in ' + Math.floor(d / 60) + 'm';
+    return 'in ' + Math.floor(d / 3600) + 'h';
   }
   function maskTarget(jid) {
     if (!jid) return '';
@@ -424,7 +453,7 @@ export const APP_JS = String.raw`(function () {
         var verb = kind === 'approve' ? 'approved' : kind === 'deny' ? 'denied' : 'retry queued';
         toast(verb, 'ok');
         $('drawer').hidden = true;
-        fetchRequests();
+        refreshActive();
       })
       .catch(function (err) {
         var msg = (err && err.message) ? err.message : 'error';
@@ -473,6 +502,52 @@ export const APP_JS = String.raw`(function () {
         fetchJson('/pending').then(renderPending).catch(noop);
       })
       .catch(function (err) { toast((err && err.message) || 'error', 'err'); });
+  }
+
+  function renderSeerrPending(payload) {
+    var rows = (payload && payload.rows) || [];
+    var tbody = $('seerr-table').querySelector('tbody');
+    clear(tbody);
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var cells = [
+        el('td', { text: r.id }),
+        el('td', { text: trunc(r.title || '', 60), title: r.title || '' }),
+        el('td', { text: r.mediaType || '' }),
+        el('td', { text: r.requestedBy || '' }),
+        el('td', { text: r.waNumber || '—' })
+      ];
+      if (WRITE) {
+        var actCell = el('td', { cls: 'cell-actions' });
+        var approveBtn = el('button', { cls: 'btn btn-sm btn-ok', text: 'approve', attrs: { type: 'button' } });
+        var denyBtn = el('button', { cls: 'btn btn-sm btn-bad', text: 'deny', attrs: { type: 'button' } });
+        (function (id) {
+          approveBtn.addEventListener('click', function () { actionSeerr(id, 'approve'); });
+          denyBtn.addEventListener('click', function () { actionSeerr(id, 'deny'); });
+        })(r.id);
+        actCell.appendChild(approveBtn);
+        actCell.appendChild(denyBtn);
+        cells.push(actCell);
+      }
+      tbody.appendChild(el('tr', null, cells));
+    }
+    $('seerr-meta').textContent = rows.length ? (rows.length + ' pending approval' + (rows.length === 1 ? '' : 's')) : 'no pending approvals';
+  }
+
+  function renderConversations(payload) {
+    var rows = (payload && payload.rows) || [];
+    var tbody = $('conversations-table').querySelector('tbody');
+    clear(tbody);
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      tbody.appendChild(el('tr', null, [
+        el('td', { text: maskTarget(r.jid) }),
+        el('td', null, [el('span', { cls: 'badge b-' + (r.awaiting || 'unknown'), text: r.awaiting || '' })]),
+        el('td', { text: trunc(r.payloadPreview || '', 50), title: r.payloadPreview || '' }),
+        el('td', { text: fmtExpiresIn(r.expiresAt) })
+      ]));
+    }
+    $('conversations-meta').textContent = rows.length ? (rows.length + ' in flight') : 'no active conversations';
   }
 
   function renderSyncthing(s) {
@@ -654,6 +729,8 @@ export const APP_JS = String.raw`(function () {
     if (tab === 'overview') fetchJson('/overview').then(renderOverview).catch(noop);
     if (tab === 'requests') fetchRequests();
     if (tab === 'pending') fetchJson('/pending').then(renderPending).catch(noop);
+    if (tab === 'seerr') fetchJson('/seerr/pending').then(renderSeerrPending).catch(noop);
+    if (tab === 'conversations') fetchJson('/conversations').then(renderConversations).catch(noop);
     if (tab === 'tasks' && WRITE) fetchJson('/tasks').then(renderTasks).catch(noop);
   }
   function refreshStatic() {

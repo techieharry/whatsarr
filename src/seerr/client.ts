@@ -33,8 +33,9 @@ const RETRY_BASE_DELAY_MS = 1_000;
 
 // Treat as transient: connection refused/reset, DNS, timeout, or 5xx.
 // Tailnet hiccups (Seerr's Docker container momentarily unreachable) are
-// what we mostly see in prod, and those resolve in <1s.
-function isTransientSeerrError(e: any, status?: number): boolean {
+// what we mostly see in prod, and those resolve in <1s. Exported so the
+// watchlist poller can tell a retryable outage from a terminal rejection.
+export function isTransientSeerrError(e: any, status?: number): boolean {
   if (status !== undefined) return status >= 500;
   const msg = String(e?.message ?? e ?? '');
   const cause = String(e?.cause?.code ?? e?.code ?? '');

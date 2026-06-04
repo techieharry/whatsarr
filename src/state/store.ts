@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-export type AwaitingKind = 'confirm' | 'movie_or_tv' | 'pick' | 'season';
+export type AwaitingKind = 'confirm' | 'movie_or_tv' | 'pick' | 'season' | 'announce_target';
 
 export type ConversationState = {
   awaiting: AwaitingKind;
@@ -20,6 +20,34 @@ export type AuditEntry = {
   seerrMediaId?: number | null;
   seerrRequestId?: number | null;
   status: string;
+};
+
+export type SubscriptionInput = {
+  subscriberJid: string;
+  subscriberNumber: string;
+  groupJid: string | null;
+  mediaType: string;                  // 'movie' | 'tv'
+  tmdbId: number;
+  seasons?: 'all' | number[] | null;  // undefined/null for movies
+};
+
+export type ActiveSubscriber = {
+  id: number;
+  subscriberJid: string;
+  subscriberNumber: string;
+  groupJid: string | null;
+  seasons: 'all' | number[] | null;
+};
+
+export type WatchlistSourceType = 'plex' | 'letterboxd' | 'plex-friend' | 'plex-self';
+
+export type StoredWatchlistSource = {
+  id: number;
+  type: WatchlistSourceType;
+  url: string;          // RSS URL for plex/letterboxd; plexfriend://<userId> for plex-friend
+  owner: string;
+  label: string;
+  createdAt: number;
 };
 
 export class Store {
@@ -99,6 +127,47 @@ export class Store {
         finished_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_commands_status_ts ON commands(status, ts DESC);
+      CREATE TABLE IF NOT EXISTS user_map (
+        sender_number  TEXT PRIMARY KEY,
+        seerr_user_id  INTEGER NOT NULL,
+        updated_at     INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS subscription (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        subscriber_jid    TEXT    NOT NULL,
+        subscriber_number TEXT    NOT NULL,
+        group_jid         TEXT,                 -- null = DM-origin; non-null routes to group w/ @mention
+        media_type        TEXT    NOT NULL,     -- 'movie' | 'tv'
+        tmdb_id           INTEGER NOT NULL,
+        seasons           TEXT,                 -- nullable JSON: '"all"' | '[1,2,3]' (TV only; null for movie)
+        created_at        INTEGER NOT NULL,
+        notified_at       INTEGER               -- null = active; set = already notified (auto-clear)
+      );
+      CREATE INDEX IF NOT EXISTS subscription_media_active
+        ON subscription(media_type, tmdb_id, notified_at);
+      CREATE TABLE IF NOT EXISTS watchlist_item (
+        source     TEXT    NOT NULL,   -- feed identity (source label)
+        guid       TEXT    NOT NULL,   -- stable per-item id from the feed
+        tmdb_id    INTEGER,            -- resolved TMDb id (null if unresolved)
+        media_type TEXT,               -- 'movie' | 'tv' (null if unresolved)
+        status     TEXT    NOT NULL,   -- 'queued' | 'available' | 'unresolved' | 'failed'
+        title      TEXT,               -- best-effort display, for logs/dashboard
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (source, guid)
+      );
+      CREATE TABLE IF NOT EXISTS watchlist_source (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        type         TEXT    NOT NULL,   -- 'plex' | 'letterboxd'
+        url          TEXT    NOT NULL,
+        owner_number TEXT    NOT NULL,   -- WhatsApp number the requests attribute to
+        label        TEXT    NOT NULL,
+        created_at   INTEGER NOT NULL,
+        UNIQUE(owner_number, url)
+      );
+      CREATE TABLE IF NOT EXISTS links_optout (
+        sender_number TEXT PRIMARY KEY,  -- present = this member silenced film-link 🎬 reactions
+        ts            INTEGER NOT NULL
+      );
     `);
     // Idempotent column adds for audit retry tracking (2026-05-26).
     // SQLite has no IF NOT EXISTS for ALTER ADD COLUMN; check pragma_table_info.
@@ -205,6 +274,24 @@ export class Store {
     this.db.prepare(`DELETE FROM conversation_state WHERE sender_jid = ?`).run(jid);
   }
 
+  // Unexpired in-flight conversations, for the dashboard #conversations panel.
+  // payloadPreview is a best-effort short string (the title/display the user is
+  // mid-flow on) pulled from the JSON payload without exposing the whole blob.
+  listActiveConversations(): { jid: string; awaiting: string; payloadPreview: string; expiresAt: number }[] {
+    const rows = this.db.prepare(
+      `SELECT sender_jid AS jid, awaiting, payload, expires_at AS expiresAt
+       FROM conversation_state WHERE expires_at > ? ORDER BY expires_at DESC`,
+    ).all(Date.now()) as any[];
+    return rows.map(r => {
+      let preview = '';
+      try {
+        const p = JSON.parse(r.payload);
+        preview = String(p?.display ?? p?.title ?? (Array.isArray(p?.candidates) ? `${p.candidates.length} options` : ''));
+      } catch { /* leave blank on unparseable payload */ }
+      return { jid: r.jid, awaiting: r.awaiting, payloadPreview: preview, expiresAt: r.expiresAt };
+    });
+  }
+
   cleanupExpiredState(): void {
     this.db.prepare(`DELETE FROM conversation_state WHERE expires_at <= ?`).run(Date.now());
   }
@@ -284,6 +371,35 @@ export class Store {
        ORDER BY ts DESC
        LIMIT ?`,
     ).all(senderNumber, limit) as any;
+  }
+
+  // Per-user Seerr account mapping. When a WhatsApp number is mapped, requests
+  // are attributed to that Seerr user instead of SEERR_DEFAULT_USER_ID, so the
+  // Seerr UI shows the real requester. Returns null when unmapped (callers pass
+  // `?? undefined` so seerr.createRequest falls back to the default user).
+  getSeerrUserId(senderNumber: string): number | null {
+    const row = this.db.prepare(
+      `SELECT seerr_user_id AS seerrUserId FROM user_map WHERE sender_number = ?`,
+    ).get(senderNumber) as any;
+    return row ? Number(row.seerrUserId) : null;
+  }
+
+  setSeerrUserId(senderNumber: string, seerrUserId: number): void {
+    this.db.prepare(`
+      INSERT INTO user_map(sender_number, seerr_user_id, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(sender_number) DO UPDATE SET seerr_user_id = excluded.seerr_user_id, updated_at = excluded.updated_at
+    `).run(senderNumber, seerrUserId, Date.now());
+  }
+
+  deleteSeerrUserId(senderNumber: string): void {
+    this.db.prepare(`DELETE FROM user_map WHERE sender_number = ?`).run(senderNumber);
+  }
+
+  listUserMap(): { senderNumber: string; seerrUserId: number; updatedAt: number }[] {
+    return this.db.prepare(
+      `SELECT sender_number AS senderNumber, seerr_user_id AS seerrUserId, updated_at AS updatedAt
+       FROM user_map ORDER BY sender_number`,
+    ).all() as any;
   }
 
   // Failed-request retry queue. Returns Whatsarr-originated audit rows whose
@@ -470,6 +586,182 @@ export class Store {
     ).get(seerrMediaType, seerrMediaId) as any;
     if (!row) return null;
     return { senderJid: row.sender_jid, senderNumber: row.sender_number, groupJid: row.group_jid };
+  }
+
+  // Multi-subscriber ready notifications. A subscription is written on each
+  // successful createRequest (movie, season-pick, or batch item). Recipient
+  // de-dup happens at notify time, not insert time, so re-subscribing for more
+  // seasons is a legitimately distinct row.
+  addSubscription(s: SubscriptionInput): number {
+    const r = this.db.prepare(`
+      INSERT INTO subscription(subscriber_jid, subscriber_number, group_jid,
+                               media_type, tmdb_id, seasons, created_at, notified_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+    `).run(
+      s.subscriberJid,
+      s.subscriberNumber,
+      s.groupJid,
+      s.mediaType,
+      s.tmdbId,
+      s.seasons == null ? null : JSON.stringify(s.seasons),
+      Date.now(),
+    );
+    return Number(r.lastInsertRowid);
+  }
+
+  // True if ANY subscription row (active or already-notified) exists for the
+  // media. Used by notifyReady to decide whether the findRequester back-compat
+  // fallback should fire: once this feature has written a subscription for a
+  // media, the audit-based fallback must NOT re-notify on a later MEDIA_AVAILABLE
+  // (which would defeat auto-clear, since the audit row stays status='queued').
+  hasAnySubscription(mediaType: string, tmdbId: number): boolean {
+    const r = this.db.prepare(
+      `SELECT 1 FROM subscription WHERE media_type = ? AND tmdb_id = ? LIMIT 1`,
+    ).get(mediaType, tmdbId) as any;
+    return !!r;
+  }
+
+  findActiveSubscribers(mediaType: string, tmdbId: number): ActiveSubscriber[] {
+    const rows = this.db.prepare(
+      `SELECT id, subscriber_jid AS subscriberJid, subscriber_number AS subscriberNumber,
+              group_jid AS groupJid, seasons
+       FROM subscription
+       WHERE media_type = ? AND tmdb_id = ? AND notified_at IS NULL
+       ORDER BY created_at ASC, id ASC`,
+    ).all(mediaType, tmdbId) as any[];
+    return rows.map(r => ({
+      id: Number(r.id),
+      subscriberJid: r.subscriberJid,
+      subscriberNumber: r.subscriberNumber,
+      groupJid: r.groupJid ?? null,
+      seasons: r.seasons ? JSON.parse(r.seasons) : null,
+    }));
+  }
+
+  markSubscriptionsNotified(ids: number[], at?: number): void {
+    if (ids.length === 0) return;
+    this.db.prepare(
+      `UPDATE subscription SET notified_at = ? WHERE id IN (${ids.map(() => '?').join(',')})`,
+    ).run(at ?? Date.now(), ...ids);
+  }
+
+  // Bound retention of subscriber identifiers: drop long-notified subscription
+  // rows (mirrors reapDeadPending). Active rows (notified_at IS NULL) are never
+  // reaped. Returns the number of rows removed.
+  reapNotifiedSubscriptions(olderThanMs: number): number {
+    const r = this.db.prepare(
+      `DELETE FROM subscription WHERE notified_at IS NOT NULL AND notified_at < ?`,
+    ).run(olderThanMs);
+    return Number(r.changes);
+  }
+
+  // Watchlist-sync seen-set. Each feed item is recorded once it's been processed
+  // (requested, found already-available, or unresolvable) so subsequent polls
+  // skip it. Keyed by (source, guid); guid is the feed's stable per-item id.
+  hasWatchlistItem(source: string, guid: string): boolean {
+    const r = this.db.prepare(
+      `SELECT 1 FROM watchlist_item WHERE source = ? AND guid = ? LIMIT 1`,
+    ).get(source, guid) as any;
+    return !!r;
+  }
+
+  recordWatchlistItem(e: { source: string; guid: string; tmdbId?: number | null; mediaType?: string | null; status: string; title?: string | null }): void {
+    this.db.prepare(`
+      INSERT INTO watchlist_item(source, guid, tmdb_id, media_type, status, title, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(source, guid) DO UPDATE SET
+        tmdb_id = excluded.tmdb_id,
+        media_type = excluded.media_type,
+        status = excluded.status,
+        title = excluded.title
+    `).run(e.source, e.guid, e.tmdbId ?? null, e.mediaType ?? null, e.status, e.title ?? null, Date.now());
+  }
+
+  listWatchlistItems(limit = 100): { source: string; guid: string; tmdbId: number | null; mediaType: string | null; status: string; title: string | null; createdAt: number }[] {
+    const rows = this.db.prepare(
+      `SELECT source, guid, tmdb_id AS tmdbId, media_type AS mediaType, status, title, created_at AS createdAt
+       FROM watchlist_item ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+    ).all(limit) as any[];
+    return rows.map(r => ({
+      source: r.source,
+      guid: r.guid,
+      tmdbId: r.tmdbId != null ? Number(r.tmdbId) : null,
+      mediaType: r.mediaType ?? null,
+      status: r.status,
+      title: r.title ?? null,
+      createdAt: Number(r.createdAt),
+    }));
+  }
+
+  // Bound watchlist_item growth (mirrors reapDeadPending / reapNotifiedSubscriptions).
+  // Re-seeing a reaped guid just re-requests it, and the availability check + the
+  // subscription/audit absorb that, so a long retention is safe.
+  reapWatchlistItems(olderThanMs: number): number {
+    const r = this.db.prepare(`DELETE FROM watchlist_item WHERE created_at < ?`).run(olderThanMs);
+    return Number(r.changes);
+  }
+
+  // Self-service watchlist feeds (members register their own via !watchlist add).
+  // Merged with the operator-seeded config.watchlist.sources by the poller.
+  addWatchlistSource(s: { type: WatchlistSourceType; url: string; owner: string; label: string }): { id: number; inserted: boolean } {
+    const r = this.db.prepare(`
+      INSERT OR IGNORE INTO watchlist_source(type, url, owner_number, label, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(s.type, s.url, s.owner, s.label, Date.now());
+    return { id: Number(r.lastInsertRowid), inserted: r.changes > 0 };
+  }
+
+  listWatchlistSources(): StoredWatchlistSource[] {
+    return this.mapWatchlistSources(this.db.prepare(
+      `SELECT id, type, url, owner_number, label, created_at FROM watchlist_source ORDER BY id`,
+    ).all() as any[]);
+  }
+
+  listWatchlistSourcesByOwner(owner: string): StoredWatchlistSource[] {
+    return this.mapWatchlistSources(this.db.prepare(
+      `SELECT id, type, url, owner_number, label, created_at FROM watchlist_source WHERE owner_number = ? ORDER BY id`,
+    ).all(owner) as any[]);
+  }
+
+  countWatchlistSourcesByOwner(owner: string): number {
+    const r = this.db.prepare(`SELECT COUNT(*) AS c FROM watchlist_source WHERE owner_number = ?`).get(owner) as any;
+    return r?.c ?? 0;
+  }
+
+  getWatchlistSource(id: number): StoredWatchlistSource | null {
+    const rows = this.mapWatchlistSources(this.db.prepare(
+      `SELECT id, type, url, owner_number, label, created_at FROM watchlist_source WHERE id = ?`,
+    ).all(id) as any[]);
+    return rows[0] ?? null;
+  }
+
+  deleteWatchlistSource(id: number): boolean {
+    const r = this.db.prepare(`DELETE FROM watchlist_source WHERE id = ?`).run(id);
+    return r.changes > 0;
+  }
+
+  // Per-member opt-out of the ambient film-link 🎬 reaction. Presence = silenced.
+  setLinksOptOut(senderNumber: string, optedOut: boolean): void {
+    if (optedOut) {
+      this.db.prepare(`INSERT OR REPLACE INTO links_optout(sender_number, ts) VALUES (?, ?)`).run(senderNumber, Date.now());
+    } else {
+      this.db.prepare(`DELETE FROM links_optout WHERE sender_number = ?`).run(senderNumber);
+    }
+  }
+
+  isLinksOptedOut(senderNumber: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM links_optout WHERE sender_number = ? LIMIT 1`).get(senderNumber);
+  }
+
+  private mapWatchlistSources(rows: any[]): StoredWatchlistSource[] {
+    return rows.map(r => ({
+      id: Number(r.id),
+      type: r.type as WatchlistSourceType,
+      url: r.url,
+      owner: r.owner_number,
+      label: r.label,
+      createdAt: Number(r.created_at),
+    }));
   }
 
   findAuditBySeerrRequestId(seerrRequestId: number): { id: number; senderNumber: string; senderJid: string; groupJid: string | null; status: string } | null {
