@@ -18,6 +18,7 @@ export type ParsedCommand =
   | { kind: 'queue' }
   | { kind: 'help' }
   | { kind: 'sync' }
+  | { kind: 'prioritize'; title: string | null }
   | { kind: 'feedback'; body: string }
   | { kind: 'issue'; body: string }
   | { kind: 'admin'; action: AdminAction; requestId: number | null }
@@ -67,6 +68,13 @@ export function parse(input: string, prefix = '!'): ParsedCommand {
   if (cmd === 'queue' || cmd === 'mine') return { kind: 'queue' };
   if (cmd === 'help') return { kind: 'help' };
   if (cmd === 'sync' || cmd === 'syncstatus') return { kind: 'sync' };
+  // Bump a request to the front: force an immediate *arr search instead of
+  // waiting for the next RSS sync. `!prioritize` (no args) targets the sender's
+  // most recent request; `!prioritize <title>` targets a specific one.
+  if (cmd === 'prioritize' || cmd === 'priority' || cmd === 'bump') {
+    const title = rest.join(' ').trim();
+    return { kind: 'prioritize', title: title || null };
+  }
   if (cmd === 'feedback' || cmd === 'fb') {
     const body = rest.join(' ').trim();
     if (!body) return { kind: 'incomplete', cmd: 'feedback', reason: 'feedback needs a message' };

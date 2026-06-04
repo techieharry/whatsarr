@@ -74,6 +74,12 @@ export class Store {
         count         INTEGER NOT NULL,
         PRIMARY KEY (sender_number, day)
       );
+      CREATE TABLE IF NOT EXISTS priority_quota (
+        sender_number TEXT NOT NULL,
+        day           TEXT NOT NULL,
+        count         INTEGER NOT NULL,
+        PRIMARY KEY (sender_number, day)
+      );
       CREATE TABLE IF NOT EXISTS dedup (
         sender_number    TEXT NOT NULL,
         media_type       TEXT NOT NULL,
@@ -311,6 +317,24 @@ export class Store {
       ON CONFLICT(sender_number, day) DO UPDATE SET count = count + 1
     `).run(senderNumber, day);
     return this.getQuota(senderNumber);
+  }
+
+  // Per-day !prioritize counter (separate budget from the request quota).
+  getPriorityCount(senderNumber: string): number {
+    const day = new Date().toISOString().slice(0, 10);
+    const row = this.db.prepare(
+      `SELECT count FROM priority_quota WHERE sender_number = ? AND day = ?`,
+    ).get(senderNumber, day) as any;
+    return row?.count ?? 0;
+  }
+
+  bumpPriority(senderNumber: string): number {
+    const day = new Date().toISOString().slice(0, 10);
+    this.db.prepare(`
+      INSERT INTO priority_quota(sender_number, day, count) VALUES (?, ?, 1)
+      ON CONFLICT(sender_number, day) DO UPDATE SET count = count + 1
+    `).run(senderNumber, day);
+    return this.getPriorityCount(senderNumber);
   }
 
   recordDedup(senderNumber: string, mediaType: string, title: string): void {

@@ -14,6 +14,7 @@ import { log } from './log.ts';
 import { Store } from './state/store.ts';
 import * as seerr from './seerr/client.ts';
 import * as syncthing from './syncthing/client.ts';
+import * as arr from './arr/client.ts';
 import { handleMessage, type IncomingMessage as InMsg } from './handler.ts';
 import { startWebhook } from './webhook.ts';
 import { sendWithRetry, isTransientSendError } from './sender.ts';
@@ -224,7 +225,7 @@ async function processMessage(sock: WASocket, m: WAMessage): Promise<void> {
     quotedText: extractQuotedText(m),
   };
 
-  const replies = await handleMessage({ store: store!, seerr, syncthing, shutdown: requestShutdown, plex: plexClient }, inMsg);
+  const replies = await handleMessage({ store: store!, seerr, syncthing, shutdown: requestShutdown, plex: plexClient, arr }, inMsg);
   for (const r of replies) {
     await sendReply(sock, r);
   }

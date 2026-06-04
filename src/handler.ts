@@ -5,6 +5,7 @@ import { resolveRoute, type MediaType, type Route } from './routing/table.ts';
 import type { Store, AwaitingKind } from './state/store.ts';
 import * as seerrModule from './seerr/client.ts';
 import * as syncthingModule from './syncthing/client.ts';
+import * as arrModule from './arr/client.ts';
 import { isAllowedGroup, isAdmin } from './auth/groups.ts';
 import { runValidation, runDiagnosis, formatValidation, formatDiagnosis } from './diagnostics.ts';
 import type { PlexClient } from './watchlist/plex.ts';
@@ -40,6 +41,9 @@ export type Deps = {
   // Optional Plex client (Pass-free watchlist path) — wired when PLEX_TOKEN is
   // set. Used by the !watchlist add plex-friend flow to validate friendship.
   plex?: PlexClient;
+  // Optional Sonarr/Radarr client for !prioritize (force-search). Wired by the
+  // index runtime; auto-discovers the *arr creds from Seerr. Tests pass a mock.
+  arr?: Pick<typeof arrModule, 'isConfigured' | 'forceSearch'>;
 };
 
 type ConfirmPayload = {
@@ -369,6 +373,9 @@ export async function handleMessage(deps: Deps, msg: IncomingMessage): Promise<R
   }
   if (parsed.kind === 'sync') {
     return await handleSync(deps, msg);
+  }
+  if (parsed.kind === 'prioritize') {
+    return await handlePrioritize(deps, msg, parsed);
   }
   if (parsed.kind === 'feedback') {
     return await handleFeedback(deps, msg, parsed.body);
@@ -893,6 +900,85 @@ async function handleQueue(deps: Deps, msg: IncomingMessage): Promise<Reply[]> {
     : `*your last ${rows.length} request${rows.length === 1 ? '' : 's'}:*`;
   const lines = [header, ...parts];
   return [reply(replyTo, lines.join('\n'), mentions)];
+}
+
+// !prioritize — bump a request to the front by forcing an immediate Sonarr/
+// Radarr search (skip the RSS-sync wait). Member-facing with a tight per-day
+// cap (cutting the line + forcing an indexer search shouldn't be unlimited).
+// Targets the named title, or the sender's most recent real request.
+async function handlePrioritize(
+  deps: Deps,
+  msg: IncomingMessage,
+  parsed: Extract<ParsedCommand, { kind: 'prioritize' }>,
+): Promise<Reply[]> {
+  const replyTo = msg.fromJid;
+  const mentions = msg.isGroup ? [msg.senderJid] : undefined;
+  const r = (text: string): Reply[] => [reply(replyTo, text, mentions)];
+
+  if (config.limits.priorityPerDay <= 0 || !deps.arr) {
+    return r(`@${msg.senderNumber} prioritize isn't enabled here.`);
+  }
+
+  // Per-member daily cap, checked before any work.
+  const cap = config.limits.priorityPerDay;
+  if (deps.store.getPriorityCount(msg.senderNumber) >= cap) {
+    return r(`@${msg.senderNumber} you've used your ${cap} priorit${cap === 1 ? 'y' : 'ies'} for today — resets tomorrow.`);
+  }
+
+  // Resolve the target: an explicit title, else the most recent real request.
+  let mediaType: 'movie' | 'tv';
+  let tmdbId: number;
+  let display: string;
+  if (parsed.title) {
+    const top = (await deps.seerr.search(parsed.title))[0];
+    if (!top) return r(`@${msg.senderNumber} couldn't find "${parsed.title}".`);
+    mediaType = top.mediaType === 'tv' ? 'tv' : 'movie';
+    tmdbId = top.id;
+    display = top.title ?? top.name ?? parsed.title;
+  } else {
+    const recent = deps.store
+      .getUserRequests(msg.senderNumber, 10)
+      .find(x => x.seerrMediaType && x.seerrMediaId && !/^prioritize\b/i.test(x.command));
+    if (!recent) {
+      return r(`@${msg.senderNumber} you have no recent request to prioritize. Try \`!prioritize <title>\`.`);
+    }
+    mediaType = recent.seerrMediaType as 'movie' | 'tv';
+    tmdbId = recent.seerrMediaId!;
+    display = recent.command.replace(/^(movie|tv|prioritize)\s+/i, '');
+  }
+
+  // Where is it? We need the *arr item id (externalServiceId) + current status.
+  const info = await deps.seerr.getMediaInfo(mediaType, tmdbId);
+  if (!info) {
+    return r(`@${msg.senderNumber} *${display}* doesn't look requested yet — \`!movie\`/\`!tv\` it first.`);
+  }
+  if (info.status === 5) {
+    return r(`@${msg.senderNumber} *${display}* is already on Plex — nothing to prioritize. ✓`);
+  }
+  if (info.externalServiceId === null) {
+    return r(`@${msg.senderNumber} *${display}* isn't with the downloader yet (still pending approval). Try again once it's approved.`);
+  }
+
+  try {
+    await deps.arr.forceSearch(mediaType, info.externalServiceId, info.serverId);
+  } catch (e: any) {
+    log_.warn({ err: e?.message, tmdbId }, 'prioritize force-search failed');
+    return r(`@${msg.senderNumber} couldn't reach the downloader to prioritize *${display}* — try again in a minute.`);
+  }
+
+  const left = cap - deps.store.bumpPriority(msg.senderNumber);
+  deps.store.audit({
+    senderJid: msg.senderJid,
+    senderNumber: msg.senderNumber,
+    groupJid: msg.isGroup ? msg.fromJid : null,
+    command: `prioritize ${display}`,
+    seerrMediaType: mediaType,
+    seerrMediaId: tmdbId,
+    seerrRequestId: null,
+    status: 'queued',
+  });
+  const tail = left > 0 ? ` (${left} priorit${left === 1 ? 'y' : 'ies'} left today)` : ` (last one for today)`;
+  return r(`🚀 @${msg.senderNumber} pushed *${display}* to the front — searching for a release now.${tail}`);
 }
 
 async function handleRequest(
@@ -1439,6 +1525,7 @@ function helpText(forAdmin: boolean): string {
     '!tv <category> <title>     TV with category',
     '!req <title>               bot asks movie or TV',
     '!queue                     your recent requests',
+    '!prioritize [title]        push a request to the front (search now)',
     '!status                    Seerr health',
     '!sync                      Plex ↔ remote-server sync status',
     '!watchlist                 auto-request from your Plex/Letterboxd feed',

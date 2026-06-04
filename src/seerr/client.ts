@@ -117,6 +117,11 @@ export type DownloadProgress = {
 export type MediaInfo = {
   status: number;
   downloadStatus: DownloadProgress[];
+  // The id of this item inside Sonarr/Radarr (Radarr movieId / Sonarr seriesId),
+  // populated once Seerr has handed the request off to the *arr. null until then.
+  // serverId picks which configured *arr server it lives on (see getArrServers).
+  externalServiceId: number | null;
+  serverId: number | null;
 };
 
 // Status enum (Seerr / Overseerr):
@@ -126,13 +131,54 @@ export async function getMediaInfo(mediaType: 'movie' | 'tv', tmdbId: number): P
   try {
     const j = await call(`/api/v1/${mediaType}/${tmdbId}`);
     if (!j?.mediaInfo) return null;
+    const mi = j.mediaInfo;
+    const ext = mi.externalServiceId ?? mi.externalServiceIdYear ?? null;
     return {
-      status: j.mediaInfo.status,
-      downloadStatus: j.mediaInfo.downloadStatus ?? [],
+      status: mi.status,
+      downloadStatus: mi.downloadStatus ?? [],
+      externalServiceId: typeof ext === 'number' ? ext : null,
+      serverId: typeof mi.serverId === 'number' ? mi.serverId : null,
     };
   } catch (e: any) {
     log_.warn({ tmdbId, err: e?.message }, 'getMediaInfo failed');
     return null;
+  }
+}
+
+// A Sonarr/Radarr server as Seerr has it configured. Seerr stores the URL +
+// API key for each *arr it pushes to, so whatsarr can reuse them (no separate
+// credentials) to drive a force-search. The apiKey is a secret — never log it.
+export type ArrServer = {
+  id: number;
+  name: string;
+  hostname: string;
+  port: number;
+  useSsl: boolean;
+  baseUrl: string;
+  apiKey: string;
+  isDefault: boolean;
+};
+
+// GET the configured Radarr/Sonarr servers from Seerr (admin-scoped; the bot's
+// API key already has it). Returns [] on any failure so the caller degrades
+// gracefully (prioritize replies "downloader not reachable").
+export async function getArrServers(type: 'radarr' | 'sonarr'): Promise<ArrServer[]> {
+  try {
+    const j = await call(`/api/v1/settings/${type}`);
+    if (!Array.isArray(j)) return [];
+    return j.map((s: any) => ({
+      id: Number(s.id ?? 0),
+      name: String(s.name ?? type),
+      hostname: String(s.hostname ?? ''),
+      port: Number(s.port ?? 0),
+      useSsl: Boolean(s.useSsl),
+      baseUrl: String(s.baseUrl ?? ''),
+      apiKey: String(s.apiKey ?? ''),
+      isDefault: Boolean(s.isDefault),
+    }));
+  } catch (e: any) {
+    log_.warn({ type, err: e?.message }, 'getArrServers failed');
+    return [];
   }
 }
 

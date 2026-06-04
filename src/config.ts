@@ -150,6 +150,18 @@ export const config = {
     defaultUserId: num('SEERR_DEFAULT_USER_ID', 1),
     webhookSecret: optional('SEERR_WEBHOOK_SECRET', ''),
   },
+  // Optional direct Sonarr/Radarr override for the !prioritize force-search.
+  // Leave empty — by default whatsarr auto-discovers both servers (URL + key)
+  // from Seerr's own settings. Set these only when the Seerr-side host can't be
+  // reached from the bot (e.g. the *arr runs on a different box).
+  radarr: {
+    url: optional('RADARR_URL', '').replace(/\/$/, ''),
+    apiKey: optional('RADARR_API_KEY', ''),
+  },
+  sonarr: {
+    url: optional('SONARR_URL', '').replace(/\/$/, ''),
+    apiKey: optional('SONARR_API_KEY', ''),
+  },
   whatsapp: {
     allowedGroups: ALLOWED_GROUPS,
     groupLabels: Object.fromEntries(
@@ -162,6 +174,9 @@ export const config = {
     requestsPerDay: num('REQUESTS_PER_DAY', 5),
     dedupWindowHours: num('DEDUP_WINDOW_HOURS', 1),
     confirmTtlMinutes: num('CONFIRM_TTL_MINUTES', 10),
+    // Per-member daily cap on !prioritize (it cuts the line + forces an indexer
+    // search). Separate from the request quota. 0 disables prioritize entirely.
+    priorityPerDay: num('PRIORITY_PER_DAY', 1),
   },
   webhook: {
     enabled: optional('WEBHOOK_ENABLED', 'true') === 'true',
