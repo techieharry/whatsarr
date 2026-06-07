@@ -398,10 +398,65 @@ export async function handleMessage(deps: Deps, msg: IncomingMessage): Promise<R
   if (parsed.kind === 'links') {
     return handleLinks(deps, msg, parsed);
   }
+  if (parsed.kind === 'feedbackAdmin') {
+    return await handleFeedbackAdmin(deps, msg, parsed);
+  }
   if (parsed.kind === 'request') {
     return await handleRequest(deps, msg, parsed);
   }
   return [];
+}
+
+async function handleFeedbackAdmin(
+  deps: Deps,
+  msg: IncomingMessage,
+  parsed: Extract<ParsedCommand, { kind: 'feedbackAdmin' }>,
+): Promise<Reply[]> {
+  // Admin gate (mirrors handleAdmin): silent drop in groups, explicit "no" in DM.
+  if (!isAdmin(msg.senderNumber)) {
+    log_.warn({ sender: msg.senderNumber, op: parsed.op }, 'feedback-admin command from non-admin');
+    if (msg.isGroup) return [];
+    return [reply(msg.senderJid, `Admin only.`)];
+  }
+
+  const replyTo = msg.fromJid;
+  const mentions = msg.isGroup ? [msg.senderJid] : undefined;
+  const prefix = msg.isGroup ? `@${msg.senderNumber} ` : '';
+
+  if (parsed.op === 'open') {
+    const rows = deps.store.listFeedback(undefined, 50, 'open');
+    if (rows.length === 0) {
+      return [reply(replyTo, `${prefix}No open feedback or issues. 🎉`, mentions)];
+    }
+    const lines = [`${prefix}*open items (${rows.length}):*`];
+    for (const r of rows) {
+      const snippet = r.body.length > 60 ? `${r.body.slice(0, 60)}…` : r.body;
+      lines.push(`• \`#${r.id}\` [${r.kind}] @${r.senderNumber}: ${snippet}`);
+    }
+    lines.push('', 'Close with `!resolve <id> [note]` or `!wontfix <id> [note]`.');
+    return [reply(replyTo, lines.join('\n'), mentions)];
+  }
+
+  // resolve / wontfix
+  const status: 'resolved' | 'wontfix' = parsed.op === 'wontfix' ? 'wontfix' : 'resolved';
+  const row = deps.store.resolveFeedback(parsed.id!, status, msg.senderNumber, parsed.note);
+  if (!row) {
+    return [reply(replyTo, `${prefix}No feedback/issue with id #${parsed.id}.`, mentions)];
+  }
+  const replies: Reply[] = [];
+  const wasClosed = row.prevStatus !== 'open';
+  replies.push(reply(
+    replyTo,
+    `${prefix}#${row.id} [${row.kind}] marked *${status}*${row.resolution ? ` — ${row.resolution}` : ''}${wasClosed ? ` (was ${row.prevStatus})` : ''}.`,
+    mentions,
+  ));
+  // Close the loop: DM the original reporter (skip if the admin IS the reporter).
+  if (row.senderJid && row.senderJid !== msg.senderJid) {
+    const verb = status === 'resolved' ? 'resolved ✓' : "closed (won't fix)";
+    const note = row.resolution ? `\n\n> ${row.resolution}` : '';
+    replies.push(reply(row.senderJid, `Update on your ${row.kind} #${row.id}: *${verb}*.${note}`));
+  }
+  return replies;
 }
 
 async function handleAdmin(
@@ -796,7 +851,7 @@ async function handleSync(deps: Deps, msg: IncomingMessage): Promise<Reply[]> {
 async function handleFeedback(deps: Deps, msg: IncomingMessage, body: string): Promise<Reply[]> {
   const v = await runValidation(deps.store);
   const report = formatValidation(v);
-  deps.store.recordFeedback({
+  const id = deps.store.recordFeedback({
     kind: 'feedback',
     senderJid: msg.senderJid,
     senderNumber: msg.senderNumber,
@@ -806,17 +861,19 @@ async function handleFeedback(deps: Deps, msg: IncomingMessage, body: string): P
   });
   const replies: Reply[] = [];
   const ack = msg.isGroup
-    ? `@${msg.senderNumber} thanks — logged. Validation: ${v.ok ? 'all good ✓' : 'see DM ✗'}`
-    : `Thanks — logged.\n\n${report}`;
+    ? `@${msg.senderNumber} thanks — logged as #${id}. Validation: ${v.ok ? 'all good ✓' : 'see DM ✗'}`
+    : `Thanks — logged as #${id}.\n\n${report}`;
   replies.push(reply(msg.fromJid, ack, msg.isGroup ? [msg.senderJid] : undefined));
   // Always DM admin(s) with the full body + validation result
   for (const adminJid of adminJidsToNotify(msg)) {
     replies.push(reply(adminJid, [
-      `*feedback* from @${msg.senderNumber}${msg.isGroup ? ' (group)' : ' (DM)'}`,
+      `*feedback* #${id} from @${msg.senderNumber}${msg.isGroup ? ' (group)' : ' (DM)'}`,
       '',
       `> ${body}`,
       '',
       report,
+      '',
+      `_close:_ \`!resolve ${id} [note]\`  ·  \`!wontfix ${id} [note]\``,
     ].join('\n')));
   }
   return replies;
@@ -825,7 +882,7 @@ async function handleFeedback(deps: Deps, msg: IncomingMessage, body: string): P
 async function handleIssue(deps: Deps, msg: IncomingMessage, body: string): Promise<Reply[]> {
   const d = await runDiagnosis(deps.store);
   const report = formatDiagnosis(d);
-  deps.store.recordFeedback({
+  const id = deps.store.recordFeedback({
     kind: 'issue',
     senderJid: msg.senderJid,
     senderNumber: msg.senderNumber,
@@ -835,16 +892,18 @@ async function handleIssue(deps: Deps, msg: IncomingMessage, body: string): Prom
   });
   const replies: Reply[] = [];
   const ack = msg.isGroup
-    ? `@${msg.senderNumber} got it — issue logged${d.validation.ok ? ' (system looks healthy)' : ' (admin pinged with diagnosis)'}.`
-    : `Got it — issue logged.\n\n${report}`;
+    ? `@${msg.senderNumber} got it — issue #${id} logged${d.validation.ok ? ' (system looks healthy)' : ' (admin pinged with diagnosis)'}.`
+    : `Got it — issue #${id} logged.\n\n${report}`;
   replies.push(reply(msg.fromJid, ack, msg.isGroup ? [msg.senderJid] : undefined));
   for (const adminJid of adminJidsToNotify(msg)) {
     replies.push(reply(adminJid, [
-      `*issue* from @${msg.senderNumber}${msg.isGroup ? ' (group)' : ' (DM)'}`,
+      `*issue* #${id} from @${msg.senderNumber}${msg.isGroup ? ' (group)' : ' (DM)'}`,
       '',
       `> ${body}`,
       '',
       report,
+      '',
+      `_close:_ \`!resolve ${id} [note]\`  ·  \`!wontfix ${id} [note]\``,
     ].join('\n')));
   }
   return replies;

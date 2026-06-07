@@ -141,7 +141,7 @@ export const INDEX_HTML = `<!doctype html>
     </nav>
     <div class="scroll-x">
       <table id="feedback-table" class="data">
-        <thead><tr><th>ts</th><th>sender</th><th>body</th><th>report</th></tr></thead>
+        <thead><tr><th>#</th><th>ts</th><th>sender</th><th>status</th><th>body</th><th>report</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -604,13 +604,44 @@ export const APP_JS = String.raw`(function () {
         details.appendChild(el('pre', { cls: 'mono', text: r.report }));
         reportTd.appendChild(details);
       }
+      var status = r.status || 'open';
+      var statusTd = el('td', { text: status, title: r.resolution || '' });
+
+      var actTd = el('td', { cls: 'cell-actions' });
+      if (WRITE && status === 'open') {
+        var resolveBtn = el('button', { cls: 'btn btn-sm', text: 'resolve', attrs: { type: 'button' } });
+        var wontfixBtn = el('button', { cls: 'btn btn-sm btn-bad', text: "won't fix", attrs: { type: 'button' } });
+        (function (id) {
+          resolveBtn.addEventListener('click', function () { actionFeedback(id, 'resolve'); });
+          wontfixBtn.addEventListener('click', function () { actionFeedback(id, 'wontfix'); });
+        })(r.id);
+        actTd.appendChild(resolveBtn);
+        actTd.appendChild(wontfixBtn);
+      }
+
       tbody.appendChild(el('tr', null, [
+        el('td', { text: '#' + r.id }),
         el('td', { text: fmtRelative(r.ts) }),
         el('td', { text: r.senderNumber || r.senderJid || '' }),
+        statusTd,
         bodyTd,
-        reportTd
+        reportTd,
+        actTd
       ]));
     }
+  }
+
+  function actionFeedback(id, kind) {
+    var label = kind === 'resolve' ? 'Resolve' : "Won't-fix";
+    var note = prompt(label + ' #' + id + ' — optional note (sent to the reporter):', '');
+    if (note === null) return; // cancelled
+    postJson('/feedback/' + encodeURIComponent(id) + '/' + kind, { note: note })
+      .then(function (resp) {
+        var notified = resp && resp.reporterNotified ? ' · reporter notified' : '';
+        toast((kind === 'resolve' ? 'resolved' : 'closed') + notified, 'ok');
+        fetchJson('/feedback?kind=' + encodeURIComponent(fbState.kind)).then(renderFeedback).catch(noop);
+      })
+      .catch(function (err) { toast((err && err.message) || 'error', 'err'); });
   }
 
   function renderTasks(payload) {

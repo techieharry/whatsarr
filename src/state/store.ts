@@ -185,6 +185,24 @@ export class Store {
     if (!have.has('last_retry_at')) {
       this.db.exec(`ALTER TABLE audit ADD COLUMN last_retry_at INTEGER`);
     }
+
+    // Idempotent column adds for the feedback/issue lifecycle (2026-06-08):
+    // status (open|resolved|wontfix) + resolution metadata. Existing rows
+    // default to 'open' so nothing is silently "handled".
+    const fbCols = this.db.prepare(`PRAGMA table_info(feedback)`).all() as any[];
+    const fbHave = new Set(fbCols.map(c => c.name));
+    if (!fbHave.has('status')) {
+      this.db.exec(`ALTER TABLE feedback ADD COLUMN status TEXT NOT NULL DEFAULT 'open'`);
+    }
+    if (!fbHave.has('resolved_at')) {
+      this.db.exec(`ALTER TABLE feedback ADD COLUMN resolved_at INTEGER`);
+    }
+    if (!fbHave.has('resolved_by')) {
+      this.db.exec(`ALTER TABLE feedback ADD COLUMN resolved_by TEXT`);
+    }
+    if (!fbHave.has('resolution')) {
+      this.db.exec(`ALTER TABLE feedback ADD COLUMN resolution TEXT`);
+    }
   }
 
   enqueuePending(target: string, text: string, mentions?: string[]): number {
@@ -562,7 +580,7 @@ export class Store {
     return r?.c ?? 0;
   }
 
-  listFeedback(kind?: 'feedback' | 'issue', limit = 100): {
+  listFeedback(kind?: 'feedback' | 'issue', limit = 100, status?: 'open' | 'resolved' | 'wontfix'): {
     id: number;
     ts: number;
     kind: string;
@@ -571,18 +589,21 @@ export class Store {
     groupJid: string | null;
     body: string;
     report: string | null;
+    status: string;
+    resolution: string | null;
+    resolvedAt: number | null;
   }[] {
-    const rows = kind
-      ? this.db.prepare(
-          `SELECT id, ts, kind, sender_jid AS senderJid, sender_number AS senderNumber,
-                  group_jid AS groupJid, body, report
-           FROM feedback WHERE kind = ? ORDER BY ts DESC LIMIT ?`,
-        ).all(kind, limit) as any[]
-      : this.db.prepare(
-          `SELECT id, ts, kind, sender_jid AS senderJid, sender_number AS senderNumber,
-                  group_jid AS groupJid, body, report
-           FROM feedback ORDER BY ts DESC LIMIT ?`,
-        ).all(limit) as any[];
+    const where: string[] = [];
+    const params: any[] = [];
+    if (kind) { where.push('kind = ?'); params.push(kind); }
+    if (status) { where.push('status = ?'); params.push(status); }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const rows = this.db.prepare(
+      `SELECT id, ts, kind, sender_jid AS senderJid, sender_number AS senderNumber,
+              group_jid AS groupJid, body, report, status,
+              resolution, resolved_at AS resolvedAt
+       FROM feedback ${whereSql} ORDER BY ts DESC LIMIT ?`,
+    ).all(...params, limit) as any[];
     return rows.map(r => ({
       id: Number(r.id),
       ts: Number(r.ts),
@@ -592,7 +613,44 @@ export class Store {
       groupJid: r.groupJid ?? null,
       body: r.body,
       report: r.report ?? null,
+      status: r.status ?? 'open',
+      resolution: r.resolution ?? null,
+      resolvedAt: r.resolvedAt ?? null,
     }));
+  }
+
+  // Resolve or dismiss a feedback/issue. status: 'resolved' | 'wontfix'. Returns
+  // the row (incl. the reporter jid + previous status) so the caller can close
+  // the loop with a DM; null if no such id.
+  resolveFeedback(
+    id: number,
+    status: 'resolved' | 'wontfix',
+    resolvedBy: string,
+    resolution: string | null,
+  ): { id: number; kind: string; senderJid: string; senderNumber: string; body: string; prevStatus: string; status: string; resolution: string | null } | null {
+    const row = this.db.prepare(
+      `SELECT id, kind, sender_jid AS senderJid, sender_number AS senderNumber, body, status
+       FROM feedback WHERE id = ?`,
+    ).get(id) as any;
+    if (!row) return null;
+    this.db.prepare(
+      `UPDATE feedback SET status = ?, resolved_at = ?, resolved_by = ?, resolution = ? WHERE id = ?`,
+    ).run(status, Date.now(), resolvedBy, resolution, id);
+    return {
+      id: Number(row.id),
+      kind: String(row.kind),
+      senderJid: String(row.senderJid),
+      senderNumber: String(row.senderNumber),
+      body: String(row.body),
+      prevStatus: String(row.status ?? 'open'),
+      status,
+      resolution,
+    };
+  }
+
+  countOpenFeedback(): number {
+    const r = this.db.prepare(`SELECT COUNT(*) AS c FROM feedback WHERE status = 'open'`).get() as any;
+    return r?.c ?? 0;
   }
 
   countRetryEligible(): number {

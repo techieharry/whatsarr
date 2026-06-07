@@ -404,7 +404,7 @@ test('!issue: ack + admin DM with diagnosis containing audit and pending counter
     { fromJid: ALLOWED_GROUP, senderJid: USER_JID, senderNumber: USER_NUM, text: '!issue ready DM never arrived', isGroup: true },
   );
   assert.equal(replies.length, 2);
-  assert.match(replies[0]!.text, /issue logged/);
+  assert.match(replies[0]!.text, /issue #\d+ logged/);
   assert.equal(replies[1]!.to, '15555550100@s.whatsapp.net');
   assert.match(replies[1]!.text, /issue.*from @15551234567/);
   assert.match(replies[1]!.text, /ready DM never arrived/);

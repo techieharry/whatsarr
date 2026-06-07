@@ -26,6 +26,7 @@ export type ParsedCommand =
   | { kind: 'watchlist'; op: 'guide' | 'add' | 'list' | 'remove'; wlType: 'plex' | 'letterboxd' | 'plex-friend' | null; url: string | null; id: number | null }
   | { kind: 'announce'; body: string }
   | { kind: 'links'; op: 'on' | 'off' | 'status' }
+  | { kind: 'feedbackAdmin'; op: 'resolve' | 'wontfix' | 'open'; id: number | null; note: string | null }
   | { kind: 'incomplete'; cmd: string; reason: string }
   | { kind: 'unknown'; reason: string };
 
@@ -99,6 +100,23 @@ export function parse(input: string, prefix = '!'): ParsedCommand {
       return { kind: 'incomplete', cmd, reason: `${cmd} needs a numeric request id` };
     }
     return { kind: 'admin', action, requestId: id };
+  }
+
+  // Feedback/issue triage (admin). `!resolve <id> [note]` / `!wontfix <id>
+  // [note]` close an item and DM the reporter; `!open` lists open items. Caller
+  // MUST check isAdmin() before executing.
+  if (cmd === 'resolve' || cmd === 'done' || cmd === 'wontfix' || cmd === 'dismiss') {
+    const op: 'resolve' | 'wontfix' = (cmd === 'wontfix' || cmd === 'dismiss') ? 'wontfix' : 'resolve';
+    if (rest.length === 0) return { kind: 'incomplete', cmd, reason: `usage: !${cmd} <id> [note]` };
+    const id = Number.parseInt(rest[0]!, 10);
+    if (!Number.isFinite(id) || id < 1) {
+      return { kind: 'incomplete', cmd, reason: `!${cmd} needs a numeric feedback/issue id` };
+    }
+    const note = rest.slice(1).join(' ').trim() || null;
+    return { kind: 'feedbackAdmin', op, id, note };
+  }
+  if (cmd === 'open' || cmd === 'inbox') {
+    return { kind: 'feedbackAdmin', op: 'open', id: null, note: null };
   }
 
   // Toggle the ambient film-link 🎬 suggestion for the sender. `!links off`

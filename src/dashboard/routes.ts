@@ -225,6 +225,36 @@ export async function dashboardRoute(req: IM, res: ServerResponse, deps: Dashboa
     return;
   }
 
+  // Resolve / dismiss a feedback or issue, then close the loop with the reporter.
+  const fbResolve = path.match(/^\/api\/feedback\/(\d+)\/(resolve|wontfix)$/);
+  if (req.method === 'POST' && fbResolve) {
+    const id = Number(fbResolve[1]);
+    const status = fbResolve[2] === 'wontfix' ? 'wontfix' : 'resolved';
+    let note: string | null = null;
+    try {
+      const body = await readJsonBody(req);
+      const n = (body as any)?.note;
+      note = typeof n === 'string' && n.trim() ? n.trim() : null;
+    } catch { /* note is optional */ }
+    const row = deps.store.resolveFeedback(id, status, 'dashboard', note);
+    if (!row) {
+      sendJson(res, 404, { id, error: 'not found' });
+      return;
+    }
+    // Close the loop: DM the original reporter (best-effort — don't fail the action).
+    let reporterNotified = false;
+    if (row.senderJid) {
+      const verb = status === 'resolved' ? 'resolved ✓' : "closed (won't fix)";
+      const noteStr = row.resolution ? `\n\n> ${row.resolution}` : '';
+      try {
+        await deps.send(row.senderJid, { text: `Update on your ${row.kind} #${row.id}: *${verb}*.${noteStr}` });
+        reporterNotified = true;
+      } catch { /* reporter DM is best-effort */ }
+    }
+    sendJson(res, 200, { id, status, reporterNotified });
+    return;
+  }
+
   if (req.method === 'POST' && path === '/api/commands') {
     let body: unknown;
     try {

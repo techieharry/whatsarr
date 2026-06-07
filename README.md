@@ -59,8 +59,13 @@ Admin-only (over DM):
 !map [<number> <userId>]   list / set WhatsApp → Seerr user mappings
 !unmap <number>            revert a number to the default Seerr user
 !announce <message>        broadcast a message to every allow-listed group
+!open                      list open feedback / issues
+!resolve <id> [note]       resolve an item (DMs the reporter the note)
+!wontfix <id> [note]       dismiss an item (DMs the reporter)
 !shutdown                  graceful exit (the service auto-restarts)
 ```
+
+`!feedback`/`!issue` reports get a referenceable `#id`; the admin can close them from chat (above) or the dashboard **feedback** panel (resolve / won't-fix buttons). Either way the original reporter is DM'd when their item is closed.
 
 ## Operator dashboard
 
