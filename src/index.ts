@@ -391,7 +391,8 @@ function requestShutdown(): void {
   log_.info('graceful shutdown requested');
   try { store?.close(); } catch (e: any) { log_.warn({ err: e?.message }, 'store.close on shutdown threw'); }
   try { stopWebhook?.(); } catch (e: any) { log_.warn({ err: e?.message }, 'stopWebhook on shutdown threw'); }
-  // Exit with 0 — NSSM is configured to auto-restart regardless of exit code.
+  // Exit with 0 — a service manager (NSSM / systemd / Docker restart policy) is
+  // expected to restart the process regardless of exit code.
   process.exit(0);
 }
 

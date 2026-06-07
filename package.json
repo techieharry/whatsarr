@@ -2,6 +2,11 @@
   "name": "whatsarr",
   "version": "0.0.1",
   "description": "WhatsApp request bot for Plex via Seerr",
+  "license": "MIT",
+  "author": "Haris Yusuf",
+  "homepage": "https://github.com/techieharry/whatsarr#readme",
+  "repository": { "type": "git", "url": "https://github.com/techieharry/whatsarr.git" },
+  "engines": { "node": ">=20" },
   "private": true,
   "type": "module",
   "scripts": {

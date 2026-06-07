@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy this file to routing.config.json and edit it for YOUR setup. Each category maps to a Sonarr/Radarr root folder + quality-profile id that whatsarr passes to Seerr as a per-request override. rootFolder must be a path that exists on your *arr host; profileId is the numeric quality-profile id (find it in Sonarr/Radarr > Settings > Profiles, or via their /api/v3/qualityprofile endpoint). 'western' is the default category used when a request has no explicit one, so it must be present under both movies and tv. forbiddenPath is an optional regex; any resolved rootFolder matching it is refused (defense in depth for curated/off-limits libraries). routing.config.json is gitignored.",
+  "movies": {
+    "western":     { "rootFolder": "/data/media/movies/Western",     "profileId": 1, "profileName": "HD-1080p" },
+    "bollywood":   { "rootFolder": "/data/media/movies/Bollywood",   "profileId": 1, "profileName": "HD-1080p" },
+    "pakistani":   { "rootFolder": "/data/media/movies/Pakistani",   "profileId": 1, "profileName": "HD-1080p" },
+    "foreign":     { "rootFolder": "/data/media/movies/Foreign",     "profileId": 1, "profileName": "HD-1080p" },
+    "documentary": { "rootFolder": "/data/media/movies/Documentary", "profileId": 1, "profileName": "HD-1080p" },
+    "anime":       { "rootFolder": "/data/media/movies/Anime",       "profileId": 2, "profileName": "Anime-1080p" },
+    "animated":    { "rootFolder": "/data/media/movies/Animated",    "profileId": 1, "profileName": "HD-1080p" }
+  },
+  "tv": {
+    "western":     { "rootFolder": "/data/media/tv/Western",         "profileId": 1, "profileName": "HD-1080p" },
+    "documentary": { "rootFolder": "/data/media/tv/Documentary",     "profileId": 1, "profileName": "HD-1080p" },
+    "bollywood":   { "rootFolder": "/data/media/tv/Bollywood",       "profileId": 1, "profileName": "HD-1080p" },
+    "asian":       { "rootFolder": "/data/media/tv/Asian",           "profileId": 1, "profileName": "HD-1080p" },
+    "anime":       { "rootFolder": "/data/media/tv/Anime",           "profileId": 2, "profileName": "Anime-1080p" },
+    "animated":    { "rootFolder": "/data/media/tv/Animated",        "profileId": 1, "profileName": "HD-1080p" }
+  },
+  "forbiddenPath": "Curated|Private"
+}

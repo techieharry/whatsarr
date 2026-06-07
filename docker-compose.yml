@@ -1,0 +1,24 @@
+services:
+  whatsarr:
+    build: .
+    container_name: whatsarr
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Dashboard + Seerr webhook. Match the left side to WEBHOOK_PORT in .env.
+      - "5056:5056"
+    volumes:
+      # Persist the sqlite DB and the WhatsApp (Baileys) session.
+      - ./data:/app/data
+      - ./auth_info_baileys:/app/auth_info_baileys
+      # Your real routes (gitignored). Copy routing.config.example.json first.
+      - ./routing.config.json:/app/routing.config.json:ro
+    # Lets the container reach Seerr/Sonarr/Radarr/Plex running on the HOST via
+    # host.docker.internal (whatsarr already treats that host as loopback). On
+    # Linux this maps it to the host gateway; on Docker Desktop it is built in.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+# First-time WhatsApp pairing (one-off, interactive — scan the QR with the bot's
+# phone). The auth_info_baileys volume keeps you paired afterwards:
+#   docker compose run --rm whatsarr npm run discover

@@ -460,7 +460,8 @@ async function handleAdmin(
       return [reply(replyTo, `${prefix}Shutdown not wired (no service hook).`, mentions)];
     }
     // Send the ack first, THEN fire shutdown after a tick so the reply has a
-    // chance to leave the socket. NSSM will auto-restart in 5s.
+    // chance to leave the socket. A configured service manager (NSSM / systemd /
+    // Docker restart policy) brings the process back up shortly after.
     setImmediate(() => {
       log_.warn({ requester: msg.senderNumber }, 'shutdown requested by admin');
       try { deps.shutdown!(); } catch (e: any) { log_.error({ err: e?.message }, 'shutdown hook threw'); }

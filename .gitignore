@@ -17,6 +17,10 @@ data/
 .env.local
 .env.*.local
 
+# per-deployment routing (real library root folders + Sonarr/Radarr profile ids).
+# ship routing.config.example.json; keep your real routing.config.json out.
+routing.config.json
+
 # logs
 logs/
 *.log

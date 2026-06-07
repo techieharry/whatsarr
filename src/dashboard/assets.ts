@@ -117,7 +117,7 @@ export const INDEX_HTML = `<!doctype html>
         <button type="submit">send</button>
         <button type="button" id="task-dm-cancel">cancel</button>
       </form>
-      <p id="task-shutdown-notice" class="meta" hidden>service shutting down — restart NSSM to bring it back</p>
+      <p id="task-shutdown-notice" class="meta" hidden>service shutting down — your service manager will restart it</p>
     </div>
     <div class="card">
       <h2>recent commands</h2>
@@ -669,7 +669,7 @@ export const APP_JS = String.raw`(function () {
     }
     if (name === 'shutdown') {
       if (!confirm('Shutdown the service?')) return;
-      if (!confirm('Really shutdown? NSSM must be restarted to bring it back.')) return;
+      if (!confirm('Really shut down? It only comes back if a service manager (NSSM / systemd / Docker restart policy) is set up.')) return;
       flashQueued(btn);
       postJson('/commands', { name: 'shutdown' })
         .then(function () {

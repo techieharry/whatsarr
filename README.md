@@ -4,7 +4,7 @@ A WhatsApp request bot for Plex media. Household members and friends request mov
 
 ## Status
 
-**Production.** Runs as an always-on service against a live Plex/Seerr/Sonarr/Radarr stack: parser + routing, multi-result and season pickers, per-user attribution, multi-subscriber "now ready" notifications, watchlist auto-sync (Plex + Letterboxd), a failed-request retry loop, and an embedded operator dashboard. Deterministic, offline parser — no LLM in the request path. `tsc --noEmit` clean; the suite is 364 tests (`npm test`).
+**Production.** Runs as an always-on service against a live Plex/Seerr/Sonarr/Radarr stack: parser + routing, multi-result and season pickers, per-user attribution, multi-subscriber "now ready" notifications, watchlist auto-sync (Plex + Letterboxd), a failed-request retry loop, and an embedded operator dashboard. Deterministic, offline parser — no LLM in the request path. `tsc --noEmit` clean; the suite is 363 tests (`npm test`).
 
 ## How it works
 
@@ -83,6 +83,9 @@ cd whatsarr
 npm install
 cp .env.example .env
 # Edit .env with your Seerr URL + API key + admin number
+cp routing.config.example.json routing.config.json
+# Edit routing.config.json — map each category to a root folder + Sonarr/Radarr
+# quality-profile id for your library (see ROUTING.md)
 ```
 
 ### Pair the bot's WhatsApp account
@@ -100,6 +103,17 @@ npm start
 ```
 
 The bot connects to WhatsApp and opens the webhook listener (default `127.0.0.1:5056`). In an allow-listed group, type `!help` to see the command list.
+
+### Run with Docker (alternative)
+
+```bash
+cp .env.example .env                                 # fill in
+cp routing.config.example.json routing.config.json   # edit for your library
+docker compose run --rm whatsarr npm run discover    # one-time QR pair (interactive)
+docker compose up -d --build                         # run detached
+```
+
+`docker-compose.yml` keeps the SQLite DB + WhatsApp session in volumes and maps `host.docker.internal` to your host so the container can reach Seerr/Sonarr/Radarr running there. See [SETUP.md](SETUP.md) for systemd, pm2, and Windows (NSSM) service options.
 
 ### Wire up the Seerr → bot webhook
 
@@ -128,8 +142,9 @@ See [PRIVACY.md](PRIVACY.md) for the metadata tradeoffs and honest user disclosu
 
 ## Docs
 
+- [SETUP.md](SETUP.md) — full install, configuration, and deployment (Docker / systemd / pm2 / Windows)
 - [ARCHITECTURE.md](ARCHITECTURE.md) — components, data flow, transport options
-- [ROUTING.md](ROUTING.md) — category → root folder / quality profile map, and the forbidden-path guard
+- [ROUTING.md](ROUTING.md) — `routing.config.json`: category → root folder / quality profile map, and the forbidden-path guard
 - [DASHBOARD.md](DASHBOARD.md) — the operator dashboard
 - [PRIVACY.md](PRIVACY.md) — accepted tradeoffs (WhatsApp = Meta metadata), mitigations, honest user disclosure
 - [SECURITY.md](SECURITY.md) — reporting security issues
@@ -138,10 +153,11 @@ See [PRIVACY.md](PRIVACY.md) for the metadata tradeoffs and honest user disclosu
 
 ```bash
 npm install
-cp .env.example .env   # fill in Seerr URL/key, allowed group JIDs, admin number(s)
+cp .env.example .env                                 # Seerr URL/key, group JIDs, admin number(s)
+cp routing.config.example.json routing.config.json   # your library root folders + profile ids
 npm run discover       # one-shot QR pairing + dump group JIDs
 npm start              # run the bot
-npm test               # 364 tests (node:test)
+npm test               # node:test suite
 npm run demo -- "!movie dune part two"   # print parse + resolved route, no network
 ```
 

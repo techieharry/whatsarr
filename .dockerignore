@@ -1,0 +1,18 @@
+node_modules
+data
+auth_info_baileys
+auth_info_baileys.bak
+.env
+.env.local
+*.log
+*.sqlite
+*.sqlite-journal
+dist
+.git
+.github
+# Real per-deployment routes are bind-mounted at runtime, never baked into the
+# image (the example fallback ships in the image).
+routing.config.json
+# Docs / scratch not needed in the runtime image.
+*.md
+!README.md

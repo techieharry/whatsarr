@@ -2,77 +2,67 @@
 
 whatsarr resolves each `(media type, category)` to a Sonarr/Radarr `(root folder, quality profile)` and sends that as a per-request override to Seerr. Seerr has one Sonarr and one Radarr entry (with sensible defaults); category routing happens at the whatsarr layer so you don't have to multiply Seerr instances.
 
-## Syntax
+Routes live in **`routing.config.json`** at the repo root — your per-deployment file, which is **gitignored**. Copy the committed template and edit it for your library:
 
-- `!movie <title>` or `!req <title>` → movies, default category (Western)
-- `!movie <category> <title>` → movies, explicit category
-- `!tv <title>` or `!show <title>` → TV, default category (Western)
-- `!tv <category> <title>` → TV, explicit category
-
-Categories are matched case-insensitively. Unknown category → falls back to default + (for `!req`) a clarification prompt.
-
-## Default movie routes (Radarr)
-
-| Category keyword(s) | Root folder | Profile ID | Profile name |
-|---|---|---|---|
-| (default / `western`) | `<your_movie_root>/Western` | `7` | HD Bluray+WEB |
-| `bollywood`, `bolly`, `hindi` | `<your_movie_root>/Bollywood` | `7` | HD Bluray+WEB |
-| `pakistani`, `pak`, `urdu` | `<your_movie_root>/Pakistani` | `7` | HD Bluray+WEB |
-| `foreign`, `intl` | `<your_movie_root>/Foreign` | `7` | HD Bluray+WEB |
-| `documentary`, `doc`, `docu` | `<your_movie_root>/Documentary` | `7` | HD Bluray+WEB |
-| `anime` | `<your_movie_root>/Anime` | `11` | REMUX-1080p - Anime |
-| `animated`, `cartoon` | `<your_movie_root>/Animated` | `7` | HD Bluray+WEB |
-
-## Default TV routes (Sonarr)
-
-| Category keyword(s) | Root folder | Profile ID | Profile name |
-|---|---|---|---|
-| (default / `western`) | `<your_tv_root>/Western` | `7` | WEB-DL (1080p) |
-| `documentary`, `doc`, `docu` | `<your_tv_root>/Documentary` | `7` | WEB-DL (1080p) |
-| `bollywood`, `bolly`, `hindi` | `<your_tv_root>/Bollywood` | `7` | WEB-DL (1080p) |
-| `asian`, `kdrama`, `cdrama`, `jdrama` | `<your_tv_root>/Asian` | `7` | WEB-DL (1080p) |
-| `anime` | `<your_tv_root>/Anime` | `9` | Remux-1080p - Anime |
-| `animated`, `cartoon` | `<your_tv_root>/Animated` | `7` | WEB-DL (1080p) |
-
-## Customizing
-
-Edit [`src/routing/table.ts`](src/routing/table.ts). The structure:
-
-```ts
-export const MOVIE_ROUTES: Partial<Record<Category, Route>> = {
-  western: { rootFolder: 'X:/Plex/Movies/Western', profileId: 7, profileName: 'HD Bluray+WEB' },
-  // ...
-};
-
-export const TV_ROUTES: Partial<Record<Category, Route>> = {
-  western: { rootFolder: 'X:/Plex/TV/Western', profileId: 7, profileName: 'WEB-DL (1080p)' },
-  // ...
-};
+```bash
+cp routing.config.example.json routing.config.json
 ```
 
-Profile IDs come from your Sonarr/Radarr instance: `GET /api/v3/qualityprofile` returns the list. Root folders: `GET /api/v3/rootfolder`. These must exist on the Sonarr/Radarr side before they'll work.
+The loader ([`src/routing/config.ts`](src/routing/config.ts)) reads `routing.config.json` at startup, validates it, and fails fast with a clear message on a bad entry. If `routing.config.json` is missing it falls back to `routing.config.example.json` (placeholder paths) with a loud warning, so a fresh clone, the test suite, and `npm run demo` still boot — but you must create your own before serving real requests.
+
+## Syntax
+
+- `!movie <title>` or `!req <title>` → movies, default category (`western`)
+- `!movie <category> <title>` → movies, explicit category
+- `!tv <title>` or `!show <title>` → TV, default category (`western`)
+- `!tv <category> <title>` → TV, explicit category
+
+Categories are matched case-insensitively. Unknown category → falls back to default + (for `!req`) a clarification prompt. `western` is the default, so it **must** be present under both `movies` and `tv`.
+
+## Config format
+
+```jsonc
+{
+  "movies": {
+    "western":     { "rootFolder": "/data/media/movies/Western",   "profileId": 1, "profileName": "HD-1080p" },
+    "anime":       { "rootFolder": "/data/media/movies/Anime",      "profileId": 2, "profileName": "Anime-1080p" }
+    // ... bollywood, pakistani, foreign, documentary, animated
+  },
+  "tv": {
+    "western":     { "rootFolder": "/data/media/tv/Western",        "profileId": 1, "profileName": "HD-1080p" },
+    "anime":       { "rootFolder": "/data/media/tv/Anime",          "profileId": 2, "profileName": "Anime-1080p" }
+    // ... documentary, bollywood, asian, animated
+  },
+  "forbiddenPath": "Curated|Private"
+}
+```
+
+Supported category keys (from the parser): `western`, `bollywood`, `pakistani`, `foreign`, `documentary`, `asian`, `anime`, `animated`. You only need the ones you use, but `western` (the default) is required. A category present under `movies` but not `tv` (or vice-versa) simply isn't routable for that media type — the request is rejected with a clear reason.
+
+### Finding your values
+
+- **`profileId`** — the numeric quality-profile id from your Sonarr/Radarr: `GET /api/v3/qualityprofile` returns the list (or read it off Settings → Profiles). `profileName` is cosmetic (logged for clarity); `profileId` is what's sent.
+- **`rootFolder`** — a root folder that already exists on the Sonarr/Radarr side: `GET /api/v3/rootfolder`. Use the path format your *arr expects (POSIX `/data/...` on Linux/Docker, `Z:\\...` on Windows — note JSON requires `\\` for a backslash).
 
 ## Defense-in-depth: forbidden paths
 
-The routing table has a `FORBIDDEN_PATH` regex that **rejects any resolved route landing in a personal/curated library** even if a future config change accidentally adds it. Add your "never touch" directory patterns to that regex:
+`forbiddenPath` is an optional regular expression. Any resolved `rootFolder` matching it is **refused** — `resolveRoute()` throws — even if a config edit accidentally points a category at a curated/off-limits library. Leave it out (or empty) to disable the guard.
 
-```ts
-export const FORBIDDEN_PATH = /(MyName's|Curated|Archive)/;
+```json
+"forbiddenPath": "Curated|Archive|Private"
 ```
-
-`resolveRoute()` throws if a resolved route's `rootFolder` matches.
 
 ## How the override is passed to Seerr
 
 ```json
 {
   "mediaType": "movie",
-  "mediaId": <tmdb_id>,
-  "rootFolder": "X:/Plex/Movies/Bollywood",
-  "profileId": 7,
+  "mediaId": 12345,
+  "rootFolder": "/data/media/movies/Bollywood",
+  "profileId": 1,
   "serverId": 0,
   "languageProfileId": 1,
-  "userId": <seerr_user_id>
+  "userId": 1
 }
 ```
 
@@ -80,11 +70,11 @@ For TV, add `"seasons": "all"` or an array of season numbers (e.g. `[1, 3]`).
 
 ## Examples
 
-| WhatsApp message | Resolves to |
+| WhatsApp message | Resolves to (with the example config) |
 |---|---|
-| `!movie dune part two` | Western movies / HD Bluray+WEB |
-| `!movie bollywood laapataa ladies` | Bollywood movies / HD Bluray+WEB |
-| `!tv the bear` | Western shows / WEB-DL 1080p |
-| `!tv anime frieren` | Anime shows / Remux-1080p Anime |
-| `!tv asian squid game` | Asian shows / WEB-DL 1080p |
+| `!movie dune part two` | movies / `western` route |
+| `!movie bollywood laapataa ladies` | movies / `bollywood` route |
+| `!tv the bear` | tv / `western` route |
+| `!tv anime frieren` | tv / `anime` route |
+| `!tv asian squid game` | tv / `asian` route |
 | `!req chimp empire` | bot asks "movie or TV?" |
