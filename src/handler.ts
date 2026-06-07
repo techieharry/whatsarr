@@ -1665,6 +1665,9 @@ function helpText(forAdmin: boolean): string {
       '!map <number> <userId>     attribute a number\'s requests to a Seerr user',
       '!unmap <number>            revert a number to the default Seerr user',
       '!announce <message>        broadcast (you pick which group, or all)',
+      '!open                      list open feedback / issues',
+      '!resolve <id> [note]       resolve an item (DMs the reporter)',
+      '!wontfix <id> [note]       dismiss an item (DMs the reporter)',
       '!shutdown                  graceful exit (service auto-restarts)',
       '```',
     );
