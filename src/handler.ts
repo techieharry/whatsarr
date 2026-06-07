@@ -127,7 +127,7 @@ type AnnouncePayload = {
   lastReEmitAt?: number;
 };
 
-const TOP_N = 3;
+const TOP_N = 5;  // results shown in the numbered picker (raised from 3 per member feedback)
 const RE_EMIT_COOLDOWN_MS = 30_000;
 const TMDB_POSTER_BASE = 'https://image.tmdb.org/t/p/w500';
 
