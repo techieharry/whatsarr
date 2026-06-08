@@ -608,6 +608,19 @@ test('admin: !help from non-admin omits admin section', async () => {
   store.close();
 });
 
+test('admin: !help IN A GROUP omits the admin section (no leak to members)', async () => {
+  const store = s();
+  const seerr = fakeSeerr();
+  const replies = await handleMessage(
+    { store, seerr } as any,
+    { fromJid: ALLOWED_GROUP, senderJid: ADMIN_JID, senderNumber: '15555550100', text: '!help', isGroup: true },
+  );
+  assert.equal(replies.length, 1);
+  assert.doesNotMatch(replies[0]!.text, /admin only:/);
+  assert.doesNotMatch(replies[0]!.text, /!resolve/);
+  store.close();
+});
+
 // ---------- failed-request retry loop ----------
 
 function failedAuditFixture(store: any, opts: { senderJid?: string; senderNumber?: string; seerrId?: number } = {}) {

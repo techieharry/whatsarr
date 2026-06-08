@@ -358,7 +358,9 @@ export async function handleMessage(deps: Deps, msg: IncomingMessage): Promise<R
     return [reply(msg.senderJid, hint)];
   }
   if (parsed.kind === 'help') {
-    return [reply(msg.fromJid, helpText(isAdmin(msg.senderNumber)))];
+    // Admin commands must NEVER appear in a group — only an admin in a DM sees
+    // the admin section. (Admins: DM me `!help` for the admin list.)
+    return [reply(msg.fromJid, helpText(isAdmin(msg.senderNumber) && !msg.isGroup))];
   }
   if (parsed.kind === 'status') {
     try {
